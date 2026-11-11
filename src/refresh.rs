@@ -87,11 +87,11 @@ pub fn missing_reading(key: &str, name: &str) -> Reading {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::default_profiles;
+    use crate::profiles::sample_profiles;
 
     #[test]
     fn tooltip_matches_legacy_format_and_utf16_limit() {
-        let profile = default_profiles()
+        let profile = sample_profiles()
             .into_iter()
             .next()
             .unwrap_or_else(|| unreachable!());
@@ -99,7 +99,7 @@ mod tests {
         assert!(format_tooltip(&reading).contains("：94%（"));
         reading.percent = None;
         reading.message = "缓存".to_owned();
-        assert_eq!(format_tooltip(&reading), "瓦尔基里 VK M5：--（缓存）");
+        assert_eq!(format_tooltip(&reading), "测试鼠标：--（缓存）");
         let clipped = clip_tooltip(&"字".repeat(200));
         assert_eq!(clipped.encode_utf16().count(), 127);
         assert!(clipped.ends_with('…'));

@@ -4,7 +4,7 @@
 
 > **关于本项目**：这是我的第一个项目。由 Rust 原生实现。 代码和文档还在持续完善，若有疏漏欢迎提 Issue 交流。
 >
-> 内置的两份设备配置（瓦尔基里 VK M5、水月雨 GM01 Pro）来自作者自用设备，**不代表其他型号通用**。新设备请走下面的「新增设备」向导重新取证。
+> 程序**不预置任何设备**：首次启动设备列表是空的，请用主面板的「新增」向导添加自己的设备，实测读到电量后才会保存。
 
 ---
 
@@ -28,7 +28,7 @@
 
 > **首次运行会有 SmartScreen 提示**：exe 未做代码签名，Windows 会弹出「Windows 已保护你的电脑」。点「更多信息」→「仍要运行」即可放行；若下载后直接被拦，右键文件 →「属性」→ 勾选「解除锁定」→ 确定。这是未签名程序的正常现象，不代表检出病毒，彻底消除需要购买代码签名证书。
 
-双击 exe 即启动托盘常驻，托盘图标右键 →「打开面板」进入主界面。配置与运行时数据都放在 `%APPDATA%\BatteryTray\`，目录和文件在**第一次写入时**才创建；在此之前程序使用默认间隔和上面提到的两份内置设备定义。卸载只需删掉 exe 和这个目录。
+双击 exe 即启动托盘常驻，托盘图标右键 →「打开面板」进入主界面。**首次启动没有设备**：托盘会保留一个通用图标用于打开面板，点面板里的「新增」即可添加第一台设备。配置与运行时数据都放在 `%APPDATA%\BatteryTray\`，目录和文件在**第一次写入时**才创建；在此之前程序使用默认刷新间隔和空设备列表。卸载只需删掉 exe 和这个目录。
 
 ### 从源码编译
 
@@ -97,7 +97,7 @@ battery-tray.exe --install-desktop
 | `--editor [--key KEY]` | 打开新增向导；带 `--key` 时直接编辑指定设备 |
 | `--debug-ui` | 打开 HID 调试窗口（枚举接口、读取 Feature/Input、「粘贴并测试」协议 JSON） |
 | `--catalog` | 输出 JSON：配置、设备与全部 HID 接口 |
-| `--scan --vid 0x374A --pid 0xA322 [--mi N] [--passive-ms N]` | 只读收集指定设备的原始响应 |
+| `--scan --vid 0x1234 --pid 0x5678 [--mi N] [--passive-ms N]` | 只读收集指定设备的原始响应 |
 | `--send --hex "00 20 01" [--mode feature\|output] [--mi N] [--settle-ms N] [--timeout-ms N] [--read-len N]` | 发送一次查询报文并读取响应 |
 | `--apply-profile device.json --dry-run` | 试读电量但不写配置（推荐先跑这步） |
 | `--apply-profile device.json --test` | 正式写入配置并实测 |
@@ -114,7 +114,7 @@ battery-tray.exe --install-desktop
 
 ```cmd
 battery-tray.exe --catalog > catalog.json
-battery-tray.exe --scan --vid 0x374A --pid 0xA322 > scan.json
+battery-tray.exe --scan --vid 0x1234 --pid 0x5678 > scan.json
 battery-tray.exe --apply-profile device.json --dry-run > dryrun.json
 battery-tray.exe --apply-profile device.json --test > applied.json
 ```
@@ -129,7 +129,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 
 | 文件 | 说明 |
 | --- | --- |
-| `config.json` | 主配置：`interval`（秒）、`devices`（设备数组）、可选的 `calibration`（内置协议的偏移微调） |
+| `config.json` | 主配置：`interval`（秒）、`devices`（设备数组）、可选的 `calibration`（专用协议的偏移微调） |
 | `readings.json` | 托盘发布的读数快照（含递增序号与时间戳），面板订阅它；托盘退出时删除 |
 | `refresh.request` | 面板/外部投递的「请求刷新」标记，托盘每 500 ms 检查一次；与快照一样在托盘退出时清理 |
 | `config.json.corrupt-<时间戳>` | 配置文件损坏时自动备份的原始内容，不会被覆盖 |
@@ -143,17 +143,17 @@ battery-tray.exe --apply-profile device.json --test > applied.json
   "interval": 60,
   "devices": [
     {
-      "key": "mouse",
-      "name": "瓦尔基里 VK M5",
-      "protocol": "vk_mouse",
+      "key": "my_mouse",
+      "name": "我的鼠标",
+      "protocol": "hid_feature",
       "enabled": true,
       "show_in_tray": true,
       "uid": 1,
       "icon": "mouse",
       "icon_path": "",
       "match": {
-        "vid": 14154,
-        "pid": 41762,
+        "vid": 4660,
+        "pid": 22136,
         "usage_page": 65535,
         "usage": 2,
         "interface_number": -1,
@@ -180,7 +180,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 }
 ```
 
-示例里的 `vid` / `pid` 是十进制（这里对应 `0x374A` / `0xA322`）；JSON 不支持十六进制写法，命令行参数则两种都接受。字段可只写需要覆盖的部分，缺失项会由程序补默认值。手工改配置建议在托盘退出后进行；不确定时优先用向导或 `--apply-profile --dry-run`。
+示例里的 `vid` / `pid` 是十进制（这里对应 `0x1234` / `0x5678`，仅为示意值）；JSON 不支持十六进制写法，命令行参数则两种都接受。字段可只写需要覆盖的部分，缺失项会按通用默认值补齐，不会从任何预置设备继承。手工改配置建议在托盘退出后进行；不确定时优先用向导或 `--apply-profile --dry-run`。
 
 ### 协议 JSON 字段
 
@@ -193,7 +193,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 | `request` | `bytes_hex` `settle_ms` `timeout_ms` `feature_len` `read_len` `cmd` | 查询报文（十六进制，含 Report ID）、写后等待、读取超时等 |
 | `response` | `battery_offset` `battery_bytes` `battery_endian` `battery_mask` `battery_shift` `battery_scale` `battery_adjust` `valid_offset` `valid_equals` `online_offset` `online_equals` `charging_offset` `charging_mask` `charging_equals` `report_id` | 从响应中提取电量与状态；**所有偏移都相对包含 Report ID 的完整响应**，`-1` 表示禁用该检查 |
 
-支持的 `protocol`：`vk_mouse`、`darkrim`（两个内置专用协议），以及通用的 `hid_feature`、`hid_output_input`。前者用固定的查询流程，后两者完全由 `request` / `response` 驱动。
+支持的 `protocol`：`vk_mouse`、`darkrim`（两个专用协议，保留读取实现但不预置设备），以及通用的 `hid_feature`、`hid_output_input`。前者用固定的查询流程，后两者完全由 `request` / `response` 驱动。新设备推荐走「新增」向导取证，通常得到 `hid_feature` 或 `hid_output_input` 配置。
 
 ---
 
@@ -203,6 +203,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 - 跨进程设备锁按**实际接口路径**（找不到接口时回退 VID:PID + Usage + MI）命名，两个配置指向同一接收器会共用一把锁，等待超时 2.5 秒。
 - 设备离线时查询会等待超时，结果以「离线 / 未找到 / 占用中」等状态体现在读数里，读设备的工作不会阻塞界面线程。
 - 新增向导的设备枚举跑在后台线程，UI 线程只负责把结果填进列表，避免 2 秒一次卡顿。
+- 设备列表为空时托盘仍保留一个通用图标和右键菜单，用于打开面板添加第一台设备；这个占位图标不参与 HID 读取，添加设备后会自动让位。
 
 ## 项目结构
 
@@ -236,7 +237,7 @@ cargo test
 cargo build --release
 ```
 
-当前有 32 个单元测试 + 6 个集成测试，覆盖配置读写与损坏备份、协议字段归一化、缓存失效、快照往返、锁名硬件身份、向导保存落盘等。项目启用了较严格的 lint：禁止 `unwrap` / `expect` / `panic`，所有 `unsafe` 块必须写明安全理由。界面代码依赖真实窗口环境，主要靠手工验证（托盘启动、面板订阅、`--catalog` / `--once`、向导保存）。
+当前有 34 个单元测试 + 6 个集成测试，覆盖配置读写与损坏备份、协议字段归一化、缓存失效、快照往返、锁名硬件身份、空配置不注入设备、向导保存落盘等。项目启用了较严格的 lint：禁止 `unwrap` / `expect` / `panic`，所有 `unsafe` 块必须写明安全理由。界面代码依赖真实窗口环境，主要靠手工验证（托盘启动、面板订阅、`--catalog` / `--once`、向导保存）。
 
 ---
 
@@ -244,7 +245,7 @@ cargo build --release
 
 **首次运行被 Windows 拦下？** 未签名的 exe 会触发 SmartScreen，点「更多信息」→「仍要运行」；详见「快速开始」。
 
-**一打开就显示两台「未找到」设备？** 内置配置来自作者自用设备，别的电脑上一般匹配不到。在面板里删除它们，再用「新增」向导添加自己的设备即可。
+**首次打开面板是空的？** 正常，程序不预置任何设备。点工具栏「新增」，按向导取证并实测读到电量后才会出现第一张卡片。
 
 **面板数据一直不更新？** 先确认托盘进程在跑；托盘没运行时面板会回退本地读取，且只在打开时读一次。也可以点面板的「刷新」。
 

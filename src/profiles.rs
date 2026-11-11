@@ -266,14 +266,19 @@ fn absolute_path(text: &str) -> String {
     absolute.to_string_lossy().chars().take(1024).collect()
 }
 
-/// Returns the two built-in device definitions.
-pub fn default_profiles() -> Vec<DeviceProfile> {
-    let mut mouse = custom_profile("mouse", "瓦尔基里 VK M5", 1);
+/// Sample devices for unit tests only.
+///
+/// The shipped application has no built-in devices: a fresh install starts
+/// with an empty list and the user adds their own through the wizard. These
+/// use made-up identifiers so no real hardware details end up in the repo.
+#[cfg(test)]
+pub(crate) fn sample_profiles() -> Vec<DeviceProfile> {
+    let mut mouse = custom_profile("mouse", "测试鼠标", 1);
     mouse.protocol = "vk_mouse".to_owned();
     mouse.icon = "mouse".to_owned();
     mouse.match_ = MatchConfig {
-        vid: 0x374A,
-        pid: 0xA322,
+        vid: 0x1234,
+        pid: 0x5678,
         usage_page: Some(0xFFFF),
         usage: Some(0x0002),
         ..MatchConfig::default()
@@ -291,12 +296,12 @@ pub fn default_profiles() -> Vec<DeviceProfile> {
         report_id: 0,
         ..ResponseConfig::default()
     };
-    let mut headphone = custom_profile("headphone", "水月雨 GM01 Pro", 2);
+    let mut headphone = custom_profile("headphone", "测试耳机", 2);
     headphone.protocol = "darkrim".to_owned();
     headphone.icon = "headphone".to_owned();
     headphone.match_ = MatchConfig {
-        vid: 0x35D8,
-        pid: 0x0133,
+        vid: 0x1234,
+        pid: 0x9ABC,
         usage_page: Some(0x000C),
         usage: Some(0x0001),
         input_len: 64,
@@ -420,10 +425,10 @@ pub fn normalize_profile(raw: &Value, key: Option<&str>, uid: Option<u32>) -> De
         .map(str::to_owned)
         .or_else(|| source.get("key").and_then(Value::as_str).map(str::to_owned))
         .unwrap_or_default();
-    let base = default_profiles()
-        .into_iter()
-        .find(|item| item.key == resolved_key)
-        .unwrap_or_else(|| custom_profile(&resolved_key, "", uid.unwrap_or(3)));
+    // Start from a blank generic device. Field defaults must never depend on
+    // the key: a user device called "mouse" must not inherit another device's
+    // VID/PID or protocol from a built-in definition.
+    let base = custom_profile(&resolved_key, "", uid.unwrap_or(3));
     let mut data = base
         .to_value()
         .ok()
@@ -553,7 +558,10 @@ pub fn normalize_profiles(raw: &[Value]) -> Vec<DeviceProfile> {
     result
 }
 
-/// Loads profiles, falling back to built-ins for legacy or malformed config.
+/// Loads the configured devices.
+///
+/// A missing, empty or malformed `devices` array means the user has no
+/// devices. Nothing is injected: deleting every device must stay deleted.
 pub fn load_profiles(store: &ConfigStore) -> Vec<DeviceProfile> {
     let config = store.load();
     let raw = config
@@ -561,15 +569,7 @@ pub fn load_profiles(store: &ConfigStore) -> Vec<DeviceProfile> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if raw.is_empty() {
-        return default_profiles();
-    }
-    let normalized = normalize_profiles(&raw);
-    if normalized.is_empty() {
-        default_profiles()
-    } else {
-        normalized
-    }
+    normalize_profiles(&raw)
 }
 
 /// Returns only devices enabled for querying.
@@ -648,11 +648,11 @@ pub fn validate_profile(profile: &DeviceProfile) -> Vec<String> {
     errors
 }
 
-/// Validates the complete list, including unique IDs and a usable tray entry.
+/// Validates the complete list, including unique IDs.
+///
+/// An empty list is valid: the tray keeps a placeholder icon so the user can
+/// still open the panel and add the first device.
 pub fn validate_profiles(profiles: &[DeviceProfile]) -> Vec<String> {
-    if profiles.is_empty() {
-        return vec!["至少需要保留一个设备".to_owned()];
-    }
     let mut errors = Vec::new();
     let mut keys = HashSet::new();
     let mut uids = HashSet::new();
@@ -664,12 +664,6 @@ pub fn validate_profiles(profiles: &[DeviceProfile]) -> Vec<String> {
         if !uids.insert(profile.uid) {
             errors.push(format!("托盘图标 ID 重复：{}", profile.uid));
         }
-    }
-    if !profiles
-        .iter()
-        .any(|item| item.enabled && item.show_in_tray)
-    {
-        errors.push("至少需要一台“参与查询且在托盘显示”的设备，否则无法操作托盘".to_owned());
     }
     errors.sort();
     errors.dedup();
@@ -884,8 +878,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_valid_and_switches_are_independent() {
-        let profiles = default_profiles();
+    fn sample_devices_are_valid_and_switches_are_independent() {
+        let profiles = sample_profiles();
         assert!(validate_profiles(&profiles).is_empty());
         let mut off = profiles[0].clone();
         off.enabled = false;
@@ -918,15 +912,43 @@ mod tests {
             return;
         };
         assert!(store.set_interval(300).is_ok());
-        let saved = save_profiles(&store, &default_profiles());
+        let saved = save_profiles(&store, &sample_profiles());
         assert!(saved.is_ok(), "save failed: {saved:?}");
         assert_eq!(store.load().get("interval"), Some(&Value::from(300)));
         assert_eq!(load_profiles(&store).len(), 2);
     }
 
     #[test]
+    fn empty_configuration_stays_empty() {
+        let temporary = tempfile::tempdir();
+        assert!(temporary.is_ok());
+        let Some(store) = temporary
+            .ok()
+            .map(|dir| ConfigStore::new(dir.path().join("BatteryTray")))
+        else {
+            return;
+        };
+        // A fresh install has no config file, and no devices to show.
+        assert!(
+            load_profiles(&store).is_empty(),
+            "fresh install has devices"
+        );
+        // Deleting every device must persist instead of restoring built-ins.
+        assert!(save_profiles(&store, &[]).is_ok());
+        assert!(load_profiles(&store).is_empty(), "empty devices array grew");
+        // Field defaults must not depend on the key any more.
+        let blank = normalize_profile(
+            &serde_json::json!({"key": "mouse", "name": "同名设备"}),
+            None,
+            None,
+        );
+        assert_eq!(blank.match_.vid, 0);
+        assert_eq!(blank.protocol, "hid_feature");
+    }
+
+    #[test]
     fn prompt_contains_protocol_contract() {
-        let prompt = make_ai_prompt(&default_profiles()[0]);
+        let prompt = make_ai_prompt(&sample_profiles()[0]);
         for token in [
             "阶段 A",
             "battery_offset",

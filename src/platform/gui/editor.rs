@@ -1119,8 +1119,8 @@ mod tests {
 
     fn sample_json() -> String {
         serde_json::json!({
-            "name": "瓦尔基里 VK M5",
-            "match": {"vid": 14154, "pid": 41762, "usage_page": 65535, "usage": 2},
+            "name": "测试鼠标",
+            "match": {"vid": 4660, "pid": 22136, "usage_page": 65535, "usage": 2},
             "request": {"bytes_hex": "00 F7", "timeout_ms": 1000},
             "response": {"battery_offset": 3}
         })
@@ -1135,8 +1135,8 @@ mod tests {
         let Some(profile) = merged.ok() else { return };
         assert_eq!(profile.key, "vk_m5");
         assert_eq!(profile.uid, 7);
-        assert_eq!(profile.match_.vid, 14154);
-        assert_eq!(profile.match_.pid, 41762);
+        assert_eq!(profile.match_.vid, 4660);
+        assert_eq!(profile.match_.pid, 22136);
         assert!(crate::profiles::validate_profile(&profile).is_empty());
     }
 
@@ -1158,11 +1158,11 @@ mod tests {
         else {
             return;
         };
-        let seed = crate::profiles::custom_profile("vk_m5", "瓦尔基里 VK M5", 9);
+        let seed = crate::profiles::custom_profile("test_mouse", "测试鼠标", 9);
         let Ok(mut profile) = merge_protocol(&seed, &sample_json()) else {
             return;
         };
-        profile.name = "瓦尔基里 VK M5".to_owned();
+        profile.name = "测试鼠标".to_owned();
         profile.enabled = true;
         profile.show_in_tray = true;
 

@@ -9,7 +9,7 @@ use crate::platform::shell::{self, AutostartState};
 use crate::platform::sync::{NamedMutex, TRAY_MUTEX_NAME};
 use crate::policy::FailurePolicy;
 use crate::profiles::{
-    enabled_profiles, load_profiles, tray_profiles, DeviceProfile, MAX_PROFILES,
+    custom_profile, enabled_profiles, load_profiles, tray_profiles, DeviceProfile, MAX_PROFILES,
 };
 use crate::protocol::{Reading, ReadingStatus};
 use crate::refresh::compose_tooltip;
@@ -22,6 +22,44 @@ use std::process::Command;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Key of the placeholder icon shown while the device list is empty.
+const EMPTY_SLOT_KEY: &str = "__no_devices__";
+
+/// A non-queryable placeholder: it owns the tray menu but is never read as HID.
+fn empty_slot_profile() -> DeviceProfile {
+    let mut profile = custom_profile(EMPTY_SLOT_KEY, "尚未添加设备", 1);
+    profile.enabled = false;
+    profile
+}
+
+/// Resolves tray icon targets. An empty device list still needs one icon so
+/// the user can open the panel and add the first device.
+fn desired_slots(visible: Vec<DeviceProfile>) -> Vec<DeviceProfile> {
+    if visible.is_empty() {
+        vec![empty_slot_profile()]
+    } else {
+        visible
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_device_list_keeps_one_placeholder_icon() {
+        let slots = desired_slots(Vec::new());
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].key, EMPTY_SLOT_KEY);
+        assert!(!slots[0].enabled, "placeholder must never be queried");
+
+        let real = vec![custom_profile("my_mouse", "我的鼠标", 1)];
+        let slots = desired_slots(real);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].key, "my_mouse");
+    }
+}
 
 /// Starts the native notification-area process.
 pub fn run() -> Result<()> {
@@ -639,10 +677,21 @@ impl TrayState {
             // when no HID refresh is due.
             self.publish_snapshot();
         }
-        if !self.ensure_capacity(visible.len()) {
+        // With zero devices we still need one icon: otherwise there is no tray
+        // menu to open the panel and add the first device.
+        let empty = visible.is_empty();
+        let mut desired = desired_slots(visible);
+        if !empty {
+            // Release the placeholder slot so a real device can reuse it.
+            for slot in &mut self.slots {
+                if slot.assigned_key.as_deref() == Some(EMPTY_SLOT_KEY) {
+                    slot.hide();
+                }
+            }
+        }
+        if !self.ensure_capacity(desired.len()) {
             return changed;
         }
-        let mut desired = visible;
         for slot in &mut self.slots {
             if let Some(key) = slot.assigned_key.as_ref() {
                 if !desired.iter().any(|profile| &profile.key == key) {
@@ -742,10 +791,14 @@ impl TrayState {
                     slot.last_visual = Some(visual);
                 }
             }
-            let tooltip_reading = reading.cloned().unwrap_or_else(|| {
-                Reading::new(&profile, None, ReadingStatus::Unknown, "等待首次读取")
-            });
-            let tip = compose_tooltip(&tooltip_reading, &self.policy);
+            let tip = if key == EMPTY_SLOT_KEY {
+                "电量托盘 · 尚未添加设备，右键打开面板点「新增」".to_owned()
+            } else {
+                let tooltip_reading = reading.cloned().unwrap_or_else(|| {
+                    Reading::new(&profile, None, ReadingStatus::Unknown, "等待首次读取")
+                });
+                compose_tooltip(&tooltip_reading, &self.policy)
+            };
             slot.tray.set_tip(&tip);
         }
     }

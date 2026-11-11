@@ -5,9 +5,7 @@ use battery_tray::battery::{
 };
 use battery_tray::config::ConfigStore;
 use battery_tray::error::Result;
-use battery_tray::profiles::{
-    default_profiles, load_profiles, normalize_profile, save_profiles, DeviceProfile,
-};
+use battery_tray::profiles::{load_profiles, normalize_profile, save_profiles, DeviceProfile};
 use battery_tray::protocol::ReadingStatus;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -112,6 +110,14 @@ fn custom_profile() -> DeviceProfile {
     )
 }
 
+fn two_profiles() -> Vec<DeviceProfile> {
+    let mut second = custom_profile();
+    second.key = "second".to_owned();
+    second.name = "第二台设备".to_owned();
+    second.uid = 4;
+    vec![custom_profile(), second]
+}
+
 #[test]
 fn legacy_config_round_trip_preserves_calibration_and_interval() {
     let (_directory, store) = store();
@@ -123,7 +129,7 @@ fn legacy_config_round_trip_preserves_calibration_and_interval() {
             {
                 "key": "mouse", "name": "旧鼠标", "protocol": "vk_mouse", "enabled": true,
                 "show_in_tray": true, "uid": 1, "icon": "mouse",
-                "match": {"vid": 0x374A, "pid": 0xA322, "usage_page": 0xFFFF, "usage": 2},
+                "match": {"vid": 0x1234, "pid": 0x5678, "usage_page": 0xFFFF, "usage": 2},
                 "request": {"bytes_hex": "00 F7"}, "response": {"battery_offset": 3}
             }
         ],
@@ -157,7 +163,7 @@ fn saving_devices_does_not_overwrite_calibration() {
             ),
         ])
         .is_ok());
-    let saved = save_profiles(&store, &default_profiles());
+    let saved = save_profiles(&store, &two_profiles());
     assert!(saved.is_ok(), "save failed: {saved:?}");
     assert_eq!(store.load().get("interval"), Some(&Value::from(120)));
     assert_eq!(

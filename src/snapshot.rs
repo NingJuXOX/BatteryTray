@@ -112,11 +112,11 @@ pub fn take_request(directory: &Path) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::default_profiles;
+    use crate::profiles::sample_profiles;
     use crate::protocol::ReadingStatus;
 
     fn sample(sequence: u64) -> Snapshot {
-        let profile = default_profiles()
+        let profile = sample_profiles()
             .into_iter()
             .next()
             .unwrap_or_else(|| unreachable!());

@@ -641,7 +641,7 @@ fn print_help() {
     println!();
     println!("设备接入（输出 JSON，agent 可直接调用）：");
     println!("  --catalog                          列出配置、设备与全部 HID 接口");
-    println!("  --scan --vid 0x374A --pid 0xA322     只读收集原始响应");
+    println!("  --scan --vid 0x1234 --pid 0x5678     只读收集原始响应");
     println!("  --send --hex \"00 20 01\" [--mode output] [--mi N] [--timeout-ms N]");
     println!("  --apply-profile device.json --dry-run  试读电量但不写配置（先问用户是否合理）");
     println!("  --apply-profile device.json --test      正式写入并实测");
@@ -697,7 +697,7 @@ fn parse_number(value: Option<&String>, label: &str) -> std::result::Result<u16,
     } else {
         text.parse::<u16>()
     };
-    parsed.map_err(|_| format!("{label} 无效：{text}（应为 0x374A 或十进制）"))
+    parsed.map_err(|_| format!("{label} 无效：{text}（应为 0x1234 或十进制）"))
 }
 
 fn number_option(options: &HashMap<String, String>, key: &str, default: u32) -> u32 {
@@ -711,7 +711,12 @@ fn print_once(debug: bool) {
     let store = ConfigStore::from_env();
     let mut reader = crate::battery::BatteryReader::new(WindowsHidBackend::new(), store);
     reader.set_debug(debug);
-    for reading in reader.read_all(None) {
+    let readings = reader.read_all(None);
+    if readings.is_empty() {
+        println!("尚未添加设备：请打开面板点「新增」，或用 --apply-profile 导入协议 JSON。");
+        return;
+    }
+    for reading in readings {
         println!("{}", reading.line());
     }
 }
@@ -775,7 +780,7 @@ mod tests {
     #[test]
     fn slug_matches_expected_rules() {
         assert_eq!(slug("Keychron K8 Pro"), "keychron_k8_pro");
-        assert_eq!(slug("  瓦尔基里 VK M5 "), "vk_m5");
+        assert_eq!(slug("  测试鼠标 A5 "), "a5");
         assert_eq!(slug(""), "device");
     }
 }

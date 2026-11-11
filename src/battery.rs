@@ -333,7 +333,7 @@ impl<B: HidBackend> BatteryReader<B> {
                 profile,
                 None,
                 ReadingStatus::NotFound,
-                "未找到瓦尔基里接收器，请插好 2.4G 接收器",
+                "未找到鼠标接收器，请插好 2.4G 接收器",
             );
         };
         let battery_index = calibration_index(calibration, "mouse_battery_index", 2, 63);
@@ -507,7 +507,7 @@ impl<B: HidBackend> BatteryReader<B> {
                 profile,
                 None,
                 ReadingStatus::NotFound,
-                "未找到水月雨接收器，请插好 USB 接收器",
+                "未找到耳机接收器，请插好 USB 接收器",
             );
         };
         let mut device = match self.backend.open(
@@ -856,7 +856,7 @@ fn darkrim_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::default_profiles;
+    use crate::profiles::sample_profiles;
 
     #[derive(Default)]
     struct EmptyBackend {
@@ -919,9 +919,9 @@ mod tests {
         fn enumerate(&mut self) -> Result<Vec<HidInterface>> {
             Ok(vec![HidInterface {
                 path: "mouse".to_owned(),
-                vendor_id: 0x374A,
-                product_id: 0xA322,
-                product: "VK M5".to_owned(),
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                product: "Test Mouse".to_owned(),
                 manufacturer: String::new(),
                 serial: String::new(),
                 usage_page: 0xFFFF,
@@ -952,9 +952,9 @@ mod tests {
     fn device_lock_key_identifies_hardware_not_profile_key() {
         let interface = HidInterface {
             path: "mouse".to_owned(),
-            vendor_id: 0x374A,
-            product_id: 0xA322,
-            product: "VK M5".to_owned(),
+            vendor_id: 0x1234,
+            product_id: 0x5678,
+            product: "Test Mouse".to_owned(),
             manufacturer: String::new(),
             serial: String::new(),
             usage_page: 0xFFFF,
@@ -964,7 +964,7 @@ mod tests {
             feature_len: 65,
             interface_number: 2,
         };
-        let profile = default_profiles()
+        let profile = sample_profiles()
             .into_iter()
             .next()
             .unwrap_or_else(|| unreachable!());
@@ -994,7 +994,7 @@ mod tests {
             return;
         };
         let store = ConfigStore::new(directory.path().join("BatteryTray"));
-        let Some(profile) = default_profiles().into_iter().next() else {
+        let Some(profile) = sample_profiles().into_iter().next() else {
             return;
         };
         let mut response = vec![0_u8; 65];
@@ -1033,7 +1033,7 @@ mod tests {
         else {
             return;
         };
-        assert!(crate::profiles::save_profiles(&store, &default_profiles()).is_ok());
+        assert!(crate::profiles::save_profiles(&store, &sample_profiles()).is_ok());
         let mut reader = BatteryReader::new(EmptyBackend::default(), store);
         let readings = reader.read_all(None);
         assert_eq!(readings.len(), 2);
