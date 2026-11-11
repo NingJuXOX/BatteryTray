@@ -745,20 +745,21 @@ pub fn save_profiles(
 
 /// Builds the device-onboarding prompt copied by the add-device wizard.
 ///
-/// Evidence is gathered by the user (official driver first, then the web HID
-/// probe) and pasted into the conversation; no local enumeration data is baked
-/// into the prompt, so it stays valid when shared with other people.
+/// `{program_path}` resolves to the running executable at copy time, so the
+/// commands stay valid for any installation directory. `{device_block}` carries
+/// the evidence for the device the user selected (VID/PID, serial, interfaces).
 const AI_PROMPT_TEMPLATE: &str = r##"你是 Windows USB HID 只读电量协议分析助手。任务：为目标设备确定可导入「电量托盘 BatteryTray」的只读电量查询协议，并在实测确认后生成配置 JSON。
 
 本提示词采用分阶段执行：阶段 A 信息收集与取证、阶段 B 候选协议与 dry-run、阶段 C 用户确认后写入、阶段 D 最终交付。只有阶段 D 才输出纯 JSON；其他阶段允许提问、列证据、给候选、报告失败。不得为了满足“纯 JSON”而跳过取证、伪造实测或猜测字段。
 
 【目标设备与程序】
 - 目标设备：{name}
+- 设备标识：{vid_pid}
 {device_block}
 - 操作系统：Windows 10/11
-- 主程序：{program_path}（运行时自动填入当前 exe 的完整路径；分发给他人时以其实际放置位置为准）
+- 主程序：{program_path}（复制提示词时自动填入当前 exe 的完整路径；换机器后以其实际放置位置为准）
 - 配置位置：%APPDATA%\BatteryTray\config.json
-- 调试入口：托盘右键 → 调试版（「粘贴并测试」可导入 JSON 并立即实测）
+- 调试入口：命令行执行 "{program_path}" --debug-ui（枚举 HID 接口、读取 Feature/Input，「粘贴并测试」可导入 JSON 并立即实测）；或在主面板点「新增」→「JSON 导入」，粘贴后点「读取并导入」
 
 【硬性约束】
 1. 只做只读电量查询；严禁固件升级、恢复出厂、配对清除、重启设备、写存储类命令。
@@ -807,16 +808,16 @@ const AI_PROMPT_TEMPLATE: &str = r##"你是 Windows USB HID 只读电量协议�
 【阶段 B：候选协议与 dry-run】
 1. 基于证据给出一个或多个候选 JSON；每个候选必须附证据摘要：文件名/函数/字节序列，或「请求 Hex → 响应 Hex」原文。
 2. 将首选候选保存为文件，执行试读，不写配置：
-   "C:/Users/admin/Desktop/电量托盘 Rust.exe" --apply-profile <文件> --dry-run
+   "{program_path}" --apply-profile <文件> --dry-run
 3. 返回的 test_readings 给出每台设备的电量读数与状态。读到电量后立即告诉用户数值，并询问：
    「读到的电量是 XX%，与设备上看到/预期的数值是否一致？这个电量是否合理？」
 4. 在用户确认合理之前，不要写入配置。试读失败（离线/超时/数值超范围）时，报告失败原因、缺失证据和下一步核对项，回到阶段 A，不要写入。
 
 【阶段 C：用户确认后写入】
 1. 用户确认读数合理后，执行正式写入并再次实测：
-   "C:/Users/admin/Desktop/电量托盘 Rust.exe" --apply-profile <文件> --test
+   "{program_path}" --apply-profile <文件> --test
 2. 报告写入与实测结果。若失败，说明原因并回到取证，不重复盲目写入。
-3. 也可提示用户使用托盘右键 →「调试版」→「粘贴并测试」一步完成写入与实测。
+3. 也可让用户把 JSON 粘贴到主面板「新增」→「JSON 导入」页点「读取并导入」，或用 "--debug-ui" 的「粘贴并测试」，一步完成实测与导入。
 
 【阶段 D：最终交付】
 仅当已完成 dry-run、用户确认读数合理、并明确需要最终配置时，才输出最终 JSON。
@@ -940,9 +941,16 @@ mod tests {
             assert!(prompt.contains(token), "missing {token}");
         }
         assert!(
-            !prompt.contains("{program_path}"),
-            "path placeholder unresolved"
+            !prompt.contains("{program_path}") && !prompt.contains("{vid_pid}"),
+            "placeholder unresolved"
         );
+        assert!(
+            prompt.contains("--debug-ui") && prompt.contains("读取并导入"),
+            "missing current debug/import entry points"
+        );
+        // No machine-specific paths or menu entries that no longer exist.
+        assert!(!prompt.contains("C:/Users/"));
+        assert!(!prompt.contains("调试版"));
         // Local enumeration evidence and the old CLI workflow must be gone.
         assert!(!prompt.contains("【接口证据】"));
         assert!(!prompt.contains("--catalog"));
