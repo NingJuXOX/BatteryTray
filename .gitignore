@@ -1,0 +1,35 @@
+# ---------- Rust 构建产物 ----------
+/target/
+**/*.rs.bk
+*.pdb
+*.exe
+*.dll
+*.lib
+*.obj
+*.ilk
+*.exp
+
+# ---------- 内置工具链与临时目录 ----------
+# .toolchain 是便携版 cargo/rustup（约 1.7 GB），.tmp 是构建临时目录
+/.toolchain/
+/.tmp/
+/dist/
+/shots/
+
+# ---------- 运行时 / 本机数据 ----------
+# 真实配置在 %APPDATA%\BatteryTray\，这里只防误提交本地副本
+config.json
+readings.json
+refresh.request
+*.log
+*.tmp
+*.bak
+*.orig
+*~
+
+# ---------- 编辑器与系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
