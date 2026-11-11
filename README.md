@@ -3,8 +3,6 @@
 一个用 Rust 写的 Windows 原生托盘小程序：通过 USB HID **只读查询**无线鼠标、耳机等外设的电量，把结果显示在系统托盘图标和深色简洁面板里。单文件 exe 即可运行，不需要 Python、.NET 或常驻后台服务。
 
 > **关于本项目**：这是我的第一个项目。由 Rust 原生实现。 代码和文档还在持续完善，若有疏漏欢迎提 Issue 交流。
->
-> 程序**不预置任何设备**：首次启动设备列表是空的，请用主面板的「新增」向导添加自己的设备，实测读到电量后才会保存。
 
 ---
 
@@ -180,7 +178,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 }
 ```
 
-示例里的 `vid` / `pid` 是十进制（这里对应 `0x1234` / `0x5678`，仅为示意值）；JSON 不支持十六进制写法，命令行参数则两种都接受。字段可只写需要覆盖的部分，缺失项会按通用默认值补齐，不会从任何预置设备继承。手工改配置建议在托盘退出后进行；不确定时优先用向导或 `--apply-profile --dry-run`。
+示例里的 `vid` / `pid` 是十进制（这里对应 `0x1234` / `0x5678`，仅为示意值）；JSON 不支持十六进制写法，命令行参数则两种都接受。字段可只写需要覆盖的部分，缺失项会按通用默认值补齐。手工改配置建议在托盘退出后进行；不确定时优先用向导或 `--apply-profile --dry-run`。
 
 ### 协议 JSON 字段
 
@@ -193,7 +191,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 | `request` | `bytes_hex` `settle_ms` `timeout_ms` `feature_len` `read_len` `cmd` | 查询报文（十六进制，含 Report ID）、写后等待、读取超时等 |
 | `response` | `battery_offset` `battery_bytes` `battery_endian` `battery_mask` `battery_shift` `battery_scale` `battery_adjust` `valid_offset` `valid_equals` `online_offset` `online_equals` `charging_offset` `charging_mask` `charging_equals` `report_id` | 从响应中提取电量与状态；**所有偏移都相对包含 Report ID 的完整响应**，`-1` 表示禁用该检查 |
 
-支持的 `protocol`：`vk_mouse`、`darkrim`（两个专用协议，保留读取实现但不预置设备），以及通用的 `hid_feature`、`hid_output_input`。前者用固定的查询流程，后两者完全由 `request` / `response` 驱动。新设备推荐走「新增」向导取证，通常得到 `hid_feature` 或 `hid_output_input` 配置。
+支持的 `protocol`：`vk_mouse`、`darkrim`（两个专用协议，仍保留读取实现），以及通用的 `hid_feature`、`hid_output_input`。前者用固定的查询流程，后两者完全由 `request` / `response` 驱动。新设备推荐走「新增」向导取证，通常得到 `hid_feature` 或 `hid_output_input` 配置。
 
 ---
 
@@ -245,7 +243,7 @@ cargo build --release
 
 **首次运行被 Windows 拦下？** 未签名的 exe 会触发 SmartScreen，点「更多信息」→「仍要运行」；详见「快速开始」。
 
-**首次打开面板是空的？** 正常，程序不预置任何设备。点工具栏「新增」，按向导取证并实测读到电量后才会出现第一张卡片。
+**首次打开面板是空的？** 正常，点工具栏「新增」，按向导取证并实测读到电量后才会出现第一张卡片。
 
 **面板数据一直不更新？** 先确认托盘进程在跑；托盘没运行时面板会回退本地读取，且只在打开时读一次。也可以点面板的「刷新」。
 
