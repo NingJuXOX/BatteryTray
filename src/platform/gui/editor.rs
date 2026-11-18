@@ -71,6 +71,7 @@ pub fn run(key: Option<String>) -> Result<()> {
         .flags(nwg::WindowFlags::WINDOW | nwg::WindowFlags::VISIBLE)
         .build(&mut window)?;
     theme::apply(&window);
+    crate::platform::gui::apply_window_icon(&window);
 
     let title = label(&window, "")?;
     let hint = label(&window, "")?;

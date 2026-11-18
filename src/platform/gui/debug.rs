@@ -30,6 +30,7 @@ pub fn run() -> Result<()> {
         .flags(nwg::WindowFlags::WINDOW | nwg::WindowFlags::VISIBLE)
         .build(&mut window)?;
     crate::platform::gui::theme::apply(&window);
+    crate::platform::gui::apply_window_icon(&window);
     let mut list = nwg::ListView::default();
     nwg::ListView::builder()
         .parent(&window)

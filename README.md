@@ -229,6 +229,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 | `src/protocol.rs` `refresh.rs` `policy.rs` | 读数结构、刷新策略、状态判定 |
 | `src/snapshot.rs` | 跨进程读数快照与刷新请求 |
 | `src/icon.rs` `error.rs` `device_api.rs` | 图标绘制（含 SVG 栅格化）、错误类型、命令行接口 |
+| `assets/app.ico` `build.rs` | 应用图标（16–256 像素九档）与把它嵌进 exe 资源段的构建脚本 |
 | `tests/integration.rs` | 集成测试 |
 
 ## 开发

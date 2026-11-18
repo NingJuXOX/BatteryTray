@@ -111,6 +111,67 @@ pub(crate) fn status_text(status: crate::protocol::ReadingStatus) -> &'static st
     }
 }
 
+/// Resource id `build.rs` assigns to `assets/app.ico` when it embeds the icon.
+const APP_ICON_RESOURCE_ID: u16 = 1;
+
+/// Installs the embedded application icon on a window's title bar and its
+/// task-switcher entry.
+///
+/// NWG registers its window class with a null icon, and `Window::set_icon`
+/// only ever sends `ICON_SMALL`, so a window keeps the generic Windows icon
+/// until both slots are filled. The bitmap is loaded straight from this
+/// executable's resource section (`LR_SHARED`, so it is never copied or
+/// freed), which is why the icon is not bundled a second time.
+pub(crate) fn apply_window_icon(window: &nwg::Window) {
+    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED,
+        SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_SETICON,
+    };
+
+    let Some(raw) = window.handle.hwnd() else {
+        return;
+    };
+    let hwnd = HWND(raw as *mut core::ffi::c_void);
+    // SAFETY: `LR_SHARED` hands back a handle owned by the resource section, so
+    // nothing here allocates or frees a GDI object; `WM_SETICON` takes over the
+    // handle, and both sizes are re-read from the screen metrics of this
+    // window's DPI so 125% and 150% scaling pick the matching icon rung.
+    unsafe {
+        let Ok(module) = GetModuleHandleW(None) else {
+            return;
+        };
+        let instance = HINSTANCE(module.0);
+        let name = PCWSTR(APP_ICON_RESOURCE_ID as usize as *const u16);
+        let dpi = GetDpiForWindow(hwnd);
+        for (slot, width, height) in [
+            (ICON_SMALL, SM_CXSMICON, SM_CYSMICON),
+            (ICON_BIG, SM_CXICON, SM_CYICON),
+        ] {
+            let width = GetSystemMetricsForDpi(width, dpi).max(16);
+            let height = GetSystemMetricsForDpi(height, dpi).max(16);
+            let Ok(handle) = LoadImageW(
+                instance,
+                name,
+                IMAGE_ICON,
+                width,
+                height,
+                LR_DEFAULTCOLOR | LR_SHARED,
+            ) else {
+                continue;
+            };
+            SendMessageW(
+                hwnd,
+                WM_SETICON,
+                WPARAM(slot as usize),
+                LPARAM(handle.0 as isize),
+            );
+        }
+    }
+}
+
 static DPI_SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
 /// Enables Per-Monitor V2 DPI awareness once, before any window is created.
