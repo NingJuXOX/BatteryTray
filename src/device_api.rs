@@ -90,8 +90,53 @@ pub fn scan(vid: u16, pid: u16, mi: Option<i16>, passive_ms: u32) -> Value {
     } else {
         passive_ms
     };
-    let mut results = Vec::new();
-    for interface in interfaces {
+    // Every interface spends up to `listen_ms` waiting for unsolicited reports,
+    // so scanning them one by one made a two-second scan of eight interfaces
+    // take sixteen. Each worker opens its own handles, so they can run at once.
+    let mut results: Vec<Option<Value>> = interfaces.iter().map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(interfaces.len());
+        for (index, interface) in interfaces.iter().enumerate() {
+            let task = move || (index, scan_interface(interface, listen_ms));
+            match std::thread::Builder::new().spawn_scoped(scope, task) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => eprintln!("无法启动接口扫描线程：{error}"),
+            }
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok((index, value)) => results[index] = Some(value),
+                Err(_) => eprintln!("接口扫描线程意外退出"),
+            }
+        }
+    });
+    let mut scanned = Vec::with_capacity(interfaces.len());
+    for (index, interface) in interfaces.iter().enumerate() {
+        scanned.push(match results[index].take() {
+            Some(value) => value,
+            None => scan_interface(interface, listen_ms),
+        });
+    }
+    json!({
+        "ok": true,
+        "vid": format!("0x{vid:04X}"),
+        "pid": format!("0x{pid:04X}"),
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        "interfaces": scanned,
+        "notes": [
+            "scan 只读：不会发送 Output 或 SetFeature。",
+            "feature_reads 含 report ID 0..3；passive_reports 是设备主动推送的报告。",
+            "没有数据时先动一下设备再扫描，休眠中的设备不会回应。",
+        ],
+    })
+}
+
+/// Probes one interface: feature reads first, then a passive listen.
+///
+/// Returns the JSON object stored for the interface. Split out of [`scan`] so
+/// the interfaces can be probed concurrently.
+fn scan_interface(interface: &HidInterface, listen_ms: u32) -> Value {
+    {
         let mut backend = WindowsHidBackend::new();
         let mut feature = Vec::new();
         let mut passive = Vec::new();
@@ -101,7 +146,7 @@ pub fn scan(vid: u16, pid: u16, mi: Option<i16>, passive_ms: u32) -> Value {
         // keyboards and plain collections reject the open anyway.
         if interface.feature_len > 0 {
             match backend.open(
-                &interface,
+                interface,
                 OpenOptions {
                     write: true,
                     read: false,
@@ -135,7 +180,7 @@ pub fn scan(vid: u16, pid: u16, mi: Option<i16>, passive_ms: u32) -> Value {
 
         if interface.input_len > 0 {
             match backend.open(
-                &interface,
+                interface,
                 OpenOptions {
                     write: false,
                     read: true,
@@ -171,7 +216,7 @@ pub fn scan(vid: u16, pid: u16, mi: Option<i16>, passive_ms: u32) -> Value {
             }
         }
 
-        results.push(json!({
+        json!({
             "mi": interface.interface_number,
             "usage_page": format!("0x{:04X}", interface.usage_page),
             "usage": format!("0x{:04X}", interface.usage),
@@ -183,20 +228,8 @@ pub fn scan(vid: u16, pid: u16, mi: Option<i16>, passive_ms: u32) -> Value {
             "passive_reports": passive,
             "errors": errors,
             "path": interface.path.clone(),
-        }));
+        })
     }
-    json!({
-        "ok": true,
-        "vid": format!("0x{vid:04X}"),
-        "pid": format!("0x{pid:04X}"),
-        "elapsed_ms": started.elapsed().as_millis() as u64,
-        "interfaces": results,
-        "notes": [
-            "scan 只读：不会发送 Output 或 SetFeature。",
-            "feature_reads 含 report ID 0..3；passive_reports 是设备主动推送的报告。",
-            "没有数据时先动一下设备再扫描，休眠中的设备不会回应。",
-        ],
-    })
 }
 
 /// One controlled request/response round trip.
@@ -436,16 +469,23 @@ pub fn apply_profile_json(text: &str, test: bool, dry_run: bool) -> Value {
     };
 
     let readings = if test {
-        let mut reader =
-            crate::battery::BatteryReader::new(WindowsHidBackend::new(), store.clone());
-        applied
+        let wanted = applied
             .iter()
             .filter_map(|item| item.get("key").and_then(Value::as_str))
             .filter_map(|key| effective.iter().find(|profile| profile.key == key))
-            .map(|profile| {
-                let reading = reader.read_profile(profile);
+            .cloned()
+            .collect::<Vec<_>>();
+        // Enumerate once for the whole run instead of once per device: a
+        // SetupAPI walk is the slowest part of a test read and its result is
+        // the same for every interface.
+        let mut reader =
+            crate::battery::BatteryReader::new(WindowsHidBackend::new(), store.clone());
+        reader
+            .read_profiles(&wanted)
+            .into_iter()
+            .map(|reading| {
                 json!({
-                    "key": profile.key,
+                    "key": reading.key,
                     "name": reading.name,
                     "percent": reading.percent,
                     "status": format!("{:?}", reading.status),

@@ -1,0 +1,12 @@
+# Declaring the sample assets as binary stops Git from diffing, merging or
+# line-ending-rewriting them.
+*.png  binary
+*.ico  binary
+*.bmp  binary
+*.exe  binary
+*.dll  binary
+
+# The sources keep their historical line endings instead of being normalised in
+# the same commit that changes behaviour: a repository-wide renormalisation would
+# turn every CRLF file into a whole-file diff. Until that separate pass happens,
+# edit a file with the endings `git ls-files --eol` reports for it (see README).

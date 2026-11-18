@@ -73,6 +73,13 @@ impl HidBackend for FakeBackend {
     fn lock(&mut self, _key: &str, _timeout_ms: u32) -> Result<Option<Box<dyn HidLock>>> {
         Ok(Some(Box::new(FakeLock)))
     }
+
+    fn duplicate(&self) -> Self {
+        Self {
+            response: self.response.clone(),
+            inputs: self.inputs.clone(),
+        }
+    }
 }
 
 fn store() -> (tempfile::TempDir, ConfigStore) {

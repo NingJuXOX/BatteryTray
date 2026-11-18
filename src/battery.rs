@@ -8,6 +8,7 @@ use crate::protocol::{
 use chrono::{DateTime, Local};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,28 @@ use std::time::{Duration, Instant};
 /// The panel no longer reads HID while the tray runs, so contention is rare;
 /// a short wait avoids freezing a window for eight seconds on a stale lock.
 const DEVICE_LOCK_TIMEOUT_MS: u32 = 2500;
+
+/// Pause between polls when a read reported "nothing yet".
+///
+/// `read_input` returns `Ok(None)` immediately while the driver still owns the
+/// previous request, so the polling loops below used to spin a whole core for
+/// the length of the timeout.
+const READ_POLL_BACKOFF_MS: u32 = 10;
+
+/// Windows error codes that are worth a second attempt.
+///
+/// Anything else — a refused handle, a rejected report, a broken request — is
+/// reproduced identically by the retry, which then only doubles the cost of the
+/// refresh (another open, another settle delay, another timeout).
+const TRANSIENT_ERRORS: [u32; 7] = [
+    21,   // ERROR_NOT_READY
+    31,   // ERROR_GEN_FAILURE
+    170,  // ERROR_BUSY
+    258,  // ERROR_NO_MORE_ITEMS, used here for "the driver still owns the read"
+    995,  // ERROR_OPERATION_ABORTED
+    1167, // ERROR_DEVICE_NOT_CONNECTED
+    1460, // ERROR_TIMEOUT, reported by the overlapped IOCTL path
+];
 
 /// Description of one present HID interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +120,7 @@ pub trait HidDevice: Send {
 pub trait HidLock {}
 
 /// Platform backend used by [`BatteryReader`].
-pub trait HidBackend {
+pub trait HidBackend: Send {
     /// Enumerates present interfaces.
     fn enumerate(&mut self) -> Result<Vec<HidInterface>>;
     /// Opens an interface.
@@ -108,6 +131,14 @@ pub trait HidBackend {
     ) -> Result<Box<dyn HidDevice>>;
     /// Attempts to acquire a device lock before timeout.
     fn lock(&mut self, key: &str, timeout_ms: u32) -> Result<Option<Box<dyn HidLock>>>;
+    /// Creates an independent backend for another thread.
+    ///
+    /// A device is queried, and its lock released, on the thread that opened it,
+    /// so a parallel refresh needs one backend per worker instead of sharing
+    /// one. Stateful backends should hand out a handle to their shared state.
+    fn duplicate(&self) -> Self
+    where
+        Self: Sized;
 }
 
 /// Last valid mouse reading retained while the mouse is sleeping.
@@ -121,12 +152,79 @@ pub struct MouseCache {
 /// Shared process-local cache used to retain the last valid mouse reading.
 pub type SharedMouseCache = Arc<Mutex<MouseCache>>;
 
+/// Last Windows error reported by any device opened by one reader.
+///
+/// A [`Reading`] only carries a human-readable message, so the retry decision is
+/// made from the OS error code instead. The tracker below records it after every
+/// HID call; the reader inspects it once an attempt has failed.
+#[derive(Clone, Default)]
+struct DeviceError(Arc<AtomicU32>);
+
+impl DeviceError {
+    fn clear(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    fn store(&self, code: u32) {
+        self.0.store(code, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Forwards HID calls while recording the device's last error code.
+struct TrackedDevice {
+    inner: Box<dyn HidDevice>,
+    error: DeviceError,
+}
+
+impl TrackedDevice {
+    fn record<T>(&self, result: Result<T>) -> Result<T> {
+        self.error.store(self.inner.last_error());
+        result
+    }
+}
+
+impl HidDevice for TrackedDevice {
+    fn set_feature(&mut self, data: &[u8]) -> Result<bool> {
+        let result = self.inner.set_feature(data);
+        self.record(result)
+    }
+
+    fn get_feature(&mut self, length: Option<usize>, report_id: u8) -> Result<Option<Vec<u8>>> {
+        let result = self.inner.get_feature(length, report_id);
+        self.record(result)
+    }
+
+    fn write_output(&mut self, data: &[u8]) -> Result<bool> {
+        let result = self.inner.write_output(data);
+        self.record(result)
+    }
+
+    fn read_input(&mut self, timeout_ms: u32) -> Result<Option<Vec<u8>>> {
+        let result = self.inner.read_input(timeout_ms);
+        self.record(result)
+    }
+
+    fn last_error(&self) -> u32 {
+        self.inner.last_error()
+    }
+}
+
+/// Whether a failed attempt may succeed when repeated right away.
+fn is_transient_error(code: u32) -> bool {
+    TRANSIENT_ERRORS.contains(&code)
+}
+
 /// Configuration-driven battery reader with a single enumeration per refresh.
 pub struct BatteryReader<B> {
     backend: B,
     config: ConfigStore,
     mouse_cache: SharedMouseCache,
     debug: bool,
+    device_error: DeviceError,
 }
 
 impl<B: HidBackend> BatteryReader<B> {
@@ -137,6 +235,7 @@ impl<B: HidBackend> BatteryReader<B> {
             config,
             mouse_cache: Arc::new(Mutex::new(MouseCache::default())),
             debug: false,
+            device_error: DeviceError::default(),
         }
     }
 
@@ -147,6 +246,7 @@ impl<B: HidBackend> BatteryReader<B> {
             config,
             mouse_cache: cache,
             debug: false,
+            device_error: DeviceError::default(),
         }
     }
 
@@ -180,15 +280,87 @@ impl<B: HidBackend> BatteryReader<B> {
     }
 
     /// Reads explicit profiles using an existing interface snapshot.
+    ///
+    /// Every device is queried on its own thread. A sleeping or absent device
+    /// spends its whole timeout waiting, so reading 32 of them in sequence could
+    /// take half a minute and made the tray look frozen. The result keeps the
+    /// order of `profiles`.
+    ///
+    /// Locks are taken inside the worker threads on purpose: a Windows mutex
+    /// must be released by the thread that acquired it, so neither the lock nor
+    /// the device handle can be shared.
     pub fn read_profiles_with_interfaces(
         &mut self,
         profiles: &[DeviceProfile],
         interfaces: &[HidInterface],
     ) -> Vec<Reading> {
-        profiles
-            .iter()
-            .map(|profile| self.read_with_retry(profile, interfaces))
-            .collect()
+        if profiles.len() < 2 {
+            return profiles
+                .iter()
+                .map(|profile| self.read_with_retry(profile, interfaces))
+                .collect();
+        }
+        let workers = profiles.iter().map(|_| self.worker()).collect::<Vec<_>>();
+        let mut results: Vec<Option<Reading>> = profiles.iter().map(|_| None).collect();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(profiles.len());
+            for (index, (worker, profile)) in workers.into_iter().zip(profiles).enumerate() {
+                let task = move || {
+                    let mut worker = worker;
+                    (index, worker.read_with_retry(profile, interfaces))
+                };
+                match std::thread::Builder::new().spawn_scoped(scope, task) {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => eprintln!("无法启动设备读取线程：{error}"),
+                }
+            }
+            for handle in handles {
+                match handle.join() {
+                    Ok((index, reading)) => results[index] = Some(reading),
+                    Err(_) => eprintln!("设备读取线程意外退出，稍后串行重试"),
+                }
+            }
+        });
+        let mut readings = Vec::with_capacity(profiles.len());
+        for (index, profile) in profiles.iter().enumerate() {
+            let reading = match results[index].take() {
+                Some(reading) => reading,
+                None => self.worker().read_with_retry(profile, interfaces),
+            };
+            readings.push(reading);
+        }
+        readings
+    }
+
+    /// Builds a reader that owns its own backend for one worker thread.
+    fn worker(&self) -> Self {
+        Self {
+            backend: self.backend.duplicate(),
+            config: self.config.clone(),
+            mouse_cache: Arc::clone(&self.mouse_cache),
+            debug: self.debug,
+            device_error: DeviceError::default(),
+        }
+    }
+
+    /// Opens an interface and records the device's error code on failure.
+    fn open_interface(
+        &mut self,
+        interface: &HidInterface,
+        options: OpenOptions,
+    ) -> Result<Box<dyn HidDevice>> {
+        match self.backend.open(interface, options) {
+            Ok(device) => Ok(Box::new(TrackedDevice {
+                inner: device,
+                error: self.device_error.clone(),
+            })),
+            Err(error) => {
+                // The backend reports an open failure as a message, not as a
+                // Windows code: treat it as permanent rather than retry it.
+                self.device_error.clear();
+                Err(error)
+            }
+        }
     }
 
     fn enumeration_error(&self, profile: &DeviceProfile, error: &BatteryTrayError) -> Reading {
@@ -281,16 +453,28 @@ impl<B: HidBackend> BatteryReader<B> {
         // Calibration is shared by every protocol in this refresh; load it
         // once here instead of once per protocol handler (and once per retry).
         let calibration = self.config.calibration();
+        self.device_error.clear();
         let first = self.dispatch(profile, interfaces, &calibration);
         if first.status != ReadingStatus::Error {
             return first;
         }
+        let code = self.device_error.load();
+        if !is_transient_error(code) {
+            if self.debug {
+                eprintln!(
+                    "[{}] 状态 error（{}，错误码 {code}），不重试",
+                    profile.key, first.message
+                );
+            }
+            return first;
+        }
         if self.debug {
             eprintln!(
-                "[{}] 状态 error（{}），重试一次",
+                "[{}] 状态 error（{}，错误码 {code}），重试一次",
                 profile.key, first.message
             );
         }
+        self.device_error.clear();
         self.dispatch(profile, interfaces, &calibration)
     }
 
@@ -338,7 +522,7 @@ impl<B: HidBackend> BatteryReader<B> {
         };
         let battery_index = calibration_index(calibration, "mouse_battery_index", 2, 63);
         let device_index = calibration_index(calibration, "mouse_device_index", 2, 255) as u8;
-        let mut device = match self.backend.open(
+        let mut device = match self.open_interface(
             interface,
             OpenOptions {
                 write: true,
@@ -510,7 +694,7 @@ impl<B: HidBackend> BatteryReader<B> {
                 "未找到耳机接收器，请插好 USB 接收器",
             );
         };
-        let mut device = match self.backend.open(
+        let mut device = match self.open_interface(
             interface,
             OpenOptions {
                 write: true,
@@ -615,7 +799,7 @@ impl<B: HidBackend> BatteryReader<B> {
             }
         };
         let output_input = profile.protocol == "hid_output_input";
-        let mut device = match self.backend.open(
+        let mut device = match self.open_interface(
             interface,
             OpenOptions {
                 write: true,
@@ -704,7 +888,12 @@ impl<B: HidBackend> BatteryReader<B> {
                         last_reason = reading.message;
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // Nothing arrived yet: back off instead of polling flat out.
+                    std::thread::sleep(Duration::from_millis(u64::from(
+                        remaining.min(READ_POLL_BACKOFF_MS),
+                    )));
+                }
                 Err(error) => {
                     return Reading::new(
                         profile,
@@ -842,6 +1031,9 @@ fn darkrim_query(
             .as_millis()
             .clamp(10, u128::from(u32::MAX)) as u32;
         let Some(data) = device.read_input(remaining)? else {
+            std::thread::sleep(Duration::from_millis(u64::from(
+                remaining.min(READ_POLL_BACKOFF_MS),
+            )));
             continue;
         };
         if let Some(frame) = parse_darkrim_frame(&data) {
@@ -883,6 +1075,10 @@ mod tests {
         fn lock(&mut self, _key: &str, _timeout_ms: u32) -> Result<Option<Box<dyn HidLock>>> {
             Ok(Some(Box::new(EmptyLock)))
         }
+
+        fn duplicate(&self) -> Self {
+            Self::default()
+        }
     }
 
     struct ResponseDevice {
@@ -917,20 +1113,7 @@ mod tests {
 
     impl HidBackend for ResponseBackend {
         fn enumerate(&mut self) -> Result<Vec<HidInterface>> {
-            Ok(vec![HidInterface {
-                path: "mouse".to_owned(),
-                vendor_id: 0x1234,
-                product_id: 0x5678,
-                product: "Test Mouse".to_owned(),
-                manufacturer: String::new(),
-                serial: String::new(),
-                usage_page: 0xFFFF,
-                usage: 0x0002,
-                input_len: 0,
-                output_len: 0,
-                feature_len: 65,
-                interface_number: 2,
-            }])
+            Ok(vec![test_interface()])
         }
 
         fn open(
@@ -946,11 +1129,78 @@ mod tests {
         fn lock(&mut self, _key: &str, _timeout_ms: u32) -> Result<Option<Box<dyn HidLock>>> {
             Ok(Some(Box::new(EmptyLock)))
         }
+
+        fn duplicate(&self) -> Self {
+            Self {
+                response: self.response.clone(),
+            }
+        }
     }
 
-    #[test]
-    fn device_lock_key_identifies_hardware_not_profile_key() {
-        let interface = HidInterface {
+    /// Backend whose device always fails with a fixed Windows error code.
+    struct FailingDevice {
+        error: u32,
+    }
+
+    impl HidDevice for FailingDevice {
+        fn set_feature(&mut self, _data: &[u8]) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn get_feature(
+            &mut self,
+            _length: Option<usize>,
+            _report_id: u8,
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn write_output(&mut self, _data: &[u8]) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn read_input(&mut self, _timeout_ms: u32) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn last_error(&self) -> u32 {
+            self.error
+        }
+    }
+
+    struct FailingBackend {
+        error: u32,
+        opens: Arc<AtomicU32>,
+    }
+
+    impl HidBackend for FailingBackend {
+        fn enumerate(&mut self) -> Result<Vec<HidInterface>> {
+            Ok(vec![test_interface()])
+        }
+
+        fn open(
+            &mut self,
+            _interface: &HidInterface,
+            _options: OpenOptions,
+        ) -> Result<Box<dyn HidDevice>> {
+            self.opens.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(FailingDevice { error: self.error }))
+        }
+
+        fn lock(&mut self, _key: &str, _timeout_ms: u32) -> Result<Option<Box<dyn HidLock>>> {
+            Ok(Some(Box::new(EmptyLock)))
+        }
+
+        fn duplicate(&self) -> Self {
+            Self {
+                error: self.error,
+                opens: Arc::clone(&self.opens),
+            }
+        }
+    }
+
+    fn test_interface() -> HidInterface {
+        HidInterface {
             path: "mouse".to_owned(),
             vendor_id: 0x1234,
             product_id: 0x5678,
@@ -963,7 +1213,72 @@ mod tests {
             output_len: 0,
             feature_len: 65,
             interface_number: 2,
+        }
+    }
+
+    #[test]
+    fn retry_only_repeats_transient_errors() {
+        let Some(profile) = sample_profiles().into_iter().next() else {
+            return;
         };
+        let temporary = tempfile::tempdir();
+        assert!(temporary.is_ok());
+        let Some(store) = temporary
+            .ok()
+            .map(|dir| ConfigStore::new(dir.path().join("BatteryTray")))
+        else {
+            return;
+        };
+        // 1 is ERROR_INVALID_FUNCTION: repeating it cannot help. 258 means the
+        // driver still owned the read, so a second attempt is worthwhile.
+        for (error, expected) in [(1_u32, 1_u32), (258, 2)] {
+            let opens = Arc::new(AtomicU32::new(0));
+            let backend = FailingBackend {
+                error,
+                opens: Arc::clone(&opens),
+            };
+            let mut reader = BatteryReader::new(backend, store.clone());
+            let reading = reader.read_profile(&profile);
+            assert_eq!(reading.status, ReadingStatus::Error);
+            assert_eq!(
+                opens.load(Ordering::Relaxed),
+                expected,
+                "error code {error} must open the device {expected} time(s)"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_reads_keep_the_configured_order() {
+        let temporary = tempfile::tempdir();
+        assert!(temporary.is_ok());
+        let Some(store) = temporary
+            .ok()
+            .map(|dir| ConfigStore::new(dir.path().join("BatteryTray")))
+        else {
+            return;
+        };
+        let profiles = sample_profiles();
+        assert!(profiles.len() >= 2);
+        let mut reader = BatteryReader::new(EmptyBackend::default(), store);
+        let readings = reader.read_profiles_with_interfaces(&profiles, &[]);
+        let keys = readings
+            .iter()
+            .map(|reading| reading.key.clone())
+            .collect::<Vec<_>>();
+        let expected = profiles
+            .iter()
+            .map(|profile| profile.key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, expected);
+        assert!(readings
+            .iter()
+            .all(|reading| reading.status == ReadingStatus::NotFound));
+    }
+
+    #[test]
+    fn device_lock_key_identifies_hardware_not_profile_key() {
+        let interface = test_interface();
         let profile = sample_profiles()
             .into_iter()
             .next()

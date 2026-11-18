@@ -867,7 +867,7 @@ impl EditorState {
             if self.icon_kind == "custom" {
                 "尚未选择图片"
             } else {
-                "使用内置图标；也可以上传 PNG/ICO/BMP"
+                "使用内置图标；也可以上传 PNG/ICO/BMP/SVG"
             }
         } else {
             &self.icon_path
@@ -880,7 +880,7 @@ impl EditorState {
         if nwg::FileDialog::builder()
             .title("选择设备图标")
             .action(nwg::FileDialogAction::Open)
-            .filters("支持的图片(*.png;*.ico;*.bmp)|PNG(*.png)|ICO(*.ico)|BMP(*.bmp)|所有文件(*.*)")
+            .filters("支持的图片(*.png;*.ico;*.bmp;*.svg)|PNG(*.png)|ICO(*.ico)|BMP(*.bmp)|SVG(*.svg)|所有文件(*.*)")
             .build(&mut dialog)
             .is_err()
         {

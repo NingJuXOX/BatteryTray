@@ -51,7 +51,10 @@ fn with_cache<R>(action: impl FnOnce(&mut HashMap<PathBuf, CacheEntry>) -> R) ->
 }
 
 /// Cheap identity of the configuration file's current contents.
-fn file_signature(path: &Path) -> (u128, u64) {
+///
+/// Callers that cache data derived from the file (device profiles, icon
+/// renders) use this to notice an edit without parsing the file again.
+pub(crate) fn file_signature(path: &Path) -> (u128, u64) {
     match fs::metadata(path) {
         Ok(metadata) => {
             let stamp = metadata

@@ -3,9 +3,10 @@ use crate::error::{BatteryTrayError, Result};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Current device-list schema version.
 pub const DEVICES_VERSION: u64 = 1;
@@ -558,18 +559,59 @@ pub fn normalize_profiles(raw: &[Value]) -> Vec<DeviceProfile> {
     result
 }
 
+/// Normalized profiles keyed by the file they were built from.
+struct ProfileCacheEntry {
+    signature: (u128, u64),
+    profiles: Vec<DeviceProfile>,
+}
+
+static PROFILE_CACHE: OnceLock<Mutex<HashMap<PathBuf, ProfileCacheEntry>>> = OnceLock::new();
+
+fn profile_cache() -> &'static Mutex<HashMap<PathBuf, ProfileCacheEntry>> {
+    PROFILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Loads the configured devices.
 ///
 /// A missing, empty or malformed `devices` array means the user has no
 /// devices. Nothing is injected: deleting every device must stay deleted.
+///
+/// The normalized list is cached per file: a single refresh tick loads the
+/// configuration several times (choosing devices, publishing the snapshot,
+/// syncing the notification area) and normalizing every profile again just
+/// produced identical structures. The cache is keyed on the file's
+/// modification stamp and length, so a save is always noticed.
 pub fn load_profiles(store: &ConfigStore) -> Vec<DeviceProfile> {
+    let path = store.path();
+    let signature = crate::config::file_signature(&path);
+    if let Ok(cache) = profile_cache().lock() {
+        if let Some(profiles) = cache
+            .get(&path)
+            .filter(|entry| entry.signature == signature)
+            .map(|entry| entry.profiles.clone())
+        {
+            return profiles;
+        }
+    }
     let config = store.load();
     let raw = config
         .get("devices")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    normalize_profiles(&raw)
+    let profiles = normalize_profiles(&raw);
+    let mut cache = match profile_cache().lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.insert(
+        path,
+        ProfileCacheEntry {
+            signature,
+            profiles: profiles.clone(),
+        },
+    );
+    profiles
 }
 
 /// Returns only devices enabled for querying.
@@ -916,6 +958,30 @@ mod tests {
         assert!(saved.is_ok(), "save failed: {saved:?}");
         assert_eq!(store.load().get("interval"), Some(&Value::from(300)));
         assert_eq!(load_profiles(&store).len(), 2);
+    }
+
+    #[test]
+    fn cached_devices_notice_external_edits() {
+        let temporary = tempfile::tempdir();
+        assert!(temporary.is_ok());
+        let Some(store) = temporary
+            .ok()
+            .map(|dir| ConfigStore::new(dir.path().join("BatteryTray")))
+        else {
+            return;
+        };
+        let saved = save_profiles(&store, &sample_profiles());
+        assert!(saved.is_ok(), "save failed: {saved:?}");
+        assert_eq!(load_profiles(&store).len(), 2);
+        // The cached list must not hide an edit made by another window: a
+        // stale entry would keep the notification area on the old devices.
+        let mut config = store.load();
+        config.insert("devices".to_owned(), Value::Array(Vec::new()));
+        assert!(store.save(config).is_ok());
+        assert!(
+            load_profiles(&store).is_empty(),
+            "cache served the previous device list"
+        );
     }
 
     #[test]

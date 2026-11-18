@@ -767,6 +767,9 @@ impl TrayState {
     }
 
     fn refresh_all_visuals(&mut self) {
+        // The theme is one registry value for the whole taskbar; reading it per
+        // slot reopened the same key up to 32 times on every refresh.
+        let light = taskbar_is_light();
         for slot in &mut self.slots {
             let Some(profile) = slot.profile.clone() else {
                 continue;
@@ -775,7 +778,6 @@ impl TrayState {
             let reading = self.readings.get(&key);
             let percent = reading.and_then(|item| item.percent);
             let charging = reading.is_some_and(|item| item.status == ReadingStatus::Charging);
-            let light = taskbar_is_light();
             let visual = (
                 percent,
                 charging,

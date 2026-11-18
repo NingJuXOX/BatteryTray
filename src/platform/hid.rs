@@ -1,6 +1,7 @@
 use crate::battery::{HidBackend, HidDevice, HidInterface, HidLock, OpenOptions};
 use crate::error::{BatteryTrayError, Result};
 use crate::platform::sync::{hid_lock_name, NamedMutex};
+use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use windows::core::{GUID, HRESULT, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -15,22 +16,41 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
     PHIDP_PREPARSED_DATA,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_NO_MORE_ITEMS,
-    ERROR_OPERATION_ABORTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
-    WAIT_OBJECT_0,
+    CloseHandle, GetLastError, ERROR_INVALID_FUNCTION, ERROR_IO_PENDING, ERROR_NOT_FOUND,
+    ERROR_NO_MORE_ITEMS, ERROR_OPERATION_ABORTED, ERROR_TIMEOUT, GENERIC_READ, GENERIC_WRITE,
+    HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, WAIT_OBJECT_0,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_OVERLAPPED,
     FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED};
 
 const HIDP_STATUS_SUCCESS: NTSTATUS = NTSTATUS(0x0011_0000);
 const HID_LOCK_TIMEOUT_MS: u32 = 8000;
 /// Wait granted to the driver after a cancelled read so its buffers can be
 /// reclaimed safely. Until this expires the operation may still be in flight.
 const CANCEL_GRACE_MS: u32 = 2_000;
+/// Upper bound for one feature/output transfer.
+///
+/// `HidD_SetFeature`/`HidD_GetFeature`/`WriteFile` on a synchronous handle can
+/// block forever when a receiver is unplugged or a device stops answering,
+/// which used to wedge the refresh worker and leave the tray icon frozen until
+/// the program was restarted. These transfers now go through the overlapped
+/// read handle with a bounded wait instead.
+const HID_TRANSFER_TIMEOUT_MS: u32 = 2_000;
+
+// The windows crate exposes the HID helpers but not the matching IOCTL codes,
+// and there is no SDK header to borrow them from. These are the values from
+// winapi's `hidclass.h` macros:
+//   CTL_CODE(FILE_DEVICE_KEYBOARD, function, method, FILE_ANY_ACCESS)
+//   IOCTL_HID_SET_FEATURE       = HID_IN_CTL_CODE!(100)  -> method 1
+//   IOCTL_HID_GET_FEATURE       = HID_OUT_CTL_CODE!(100) -> method 2
+//   IOCTL_HID_SET_OUTPUT_REPORT = HID_IN_CTL_CODE!(101)  -> method 1
+const IOCTL_HID_SET_FEATURE: u32 = 0x000B_0191;
+const IOCTL_HID_GET_FEATURE: u32 = 0x000B_0192;
+const IOCTL_HID_SET_OUTPUT_REPORT: u32 = 0x000B_0195;
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -82,6 +102,12 @@ impl HidBackend for WindowsHidBackend {
         };
         NamedMutex::acquire(&hid_lock_name(key), timeout)
             .map(|lock| lock.map(|item| Box::new(item) as Box<dyn HidLock>))
+    }
+
+    fn duplicate(&self) -> Self {
+        // The backend keeps no state; the device handles live in
+        // `WindowsHidDevice`, which is created per worker thread.
+        Self
     }
 }
 
@@ -314,13 +340,52 @@ enum ReapOutcome {
     Pending(PendingRead),
 }
 
+/// Which buffers a feature/output transfer exposes to the driver.
+enum TransferKind {
+    /// The report is input-only; nothing is returned.
+    Send,
+    /// The report ID goes in and the driver fills the same buffer.
+    Receive,
+}
+
+/// One overlapped feature/output transfer whose buffers may outlive the call.
+///
+/// Same reasoning as [`PendingRead`]: the kernel keeps writing into these
+/// buffers after a timeout, so they live on the heap and are leaked rather than
+/// freed while the driver still owns them.
+struct PendingTransfer {
+    overlapped: Box<OVERLAPPED>,
+    buffer: Box<[u8]>,
+}
+
+impl PendingTransfer {
+    fn new(event: HANDLE, size: usize) -> Self {
+        // SAFETY: OVERLAPPED is a POD structure where all-zero means "no file
+        // offset"; the event is assigned immediately afterwards.
+        let mut overlapped: Box<OVERLAPPED> = Box::new(unsafe { zeroed() });
+        overlapped.hEvent = event;
+        Self {
+            overlapped,
+            buffer: vec![0_u8; size].into_boxed_slice(),
+        }
+    }
+}
+
 struct WindowsHidDevice {
     interface: HidInterface,
     write_handle: HANDLE,
+    /// Overlapped handle used for feature/output transfers. It is separate from
+    /// `write_handle` because that one has to stay synchronous for the
+    /// `WriteFile`/`HidD_*` fallbacks; invalid when it could not be opened.
+    transfer_handle: HANDLE,
+    /// Event that bounds feature/output transfers; invalid alongside
+    /// `transfer_handle`.
+    transfer_event: HANDLE,
     read_handle: HANDLE,
     event: HANDLE,
     last_error: u32,
     pending: Option<PendingRead>,
+    pending_transfer: Option<PendingTransfer>,
 }
 
 // SAFETY: the device is used by one protocol worker at a time. Kernel handles
@@ -338,11 +403,33 @@ impl WindowsHidDevice {
         let mut device = Self {
             interface: interface.clone(),
             write_handle,
+            transfer_handle: HANDLE::default(),
+            transfer_event: HANDLE::default(),
             read_handle: HANDLE::default(),
             event: HANDLE::default(),
             last_error: 0,
             pending: None,
+            pending_transfer: None,
         };
+        if options.write {
+            // A failed open is not fatal: the transfer helpers fall back to the
+            // synchronous handle, which keeps the old behaviour as a last
+            // resort instead of turning a slow device into an error.
+            if let Ok(handle) = open_raw(&interface.path, access, FILE_FLAG_OVERLAPPED) {
+                // SAFETY: no security attributes or name; manual reset is
+                // required so the event stays unset until the driver signals.
+                match unsafe { CreateEventW(None, true, false, None) } {
+                    Ok(event) => {
+                        device.transfer_handle = handle;
+                        device.transfer_event = event;
+                    }
+                    Err(error) => {
+                        eprintln!("为 HID 传输创建事件失败：{error}");
+                        close_handle(handle);
+                    }
+                }
+            }
+        }
         if options.read {
             // On failure `device` is dropped and its Drop impl closes every
             // handle exactly once; closing manually would double-close.
@@ -408,6 +495,173 @@ impl WindowsHidDevice {
             Some(pending)
         }
     }
+
+    /// Whether bounded feature/output transfers are available on this device.
+    fn can_transfer(&self) -> bool {
+        !self.transfer_handle.is_invalid() && !self.transfer_event.is_invalid()
+    }
+
+    /// Checks a previously abandoned transfer without blocking.
+    fn reap_transfer(&self, pending: PendingTransfer) -> TransferOutcome {
+        // SAFETY: the event belongs to this device and the timeout is zero.
+        let status = unsafe { WaitForSingleObject(self.transfer_event, 0) };
+        if status != WAIT_OBJECT_0 {
+            return TransferOutcome::Pending(pending);
+        }
+        let mut count = 0_u32;
+        // SAFETY: the overlapped structure and counter stay alive for the call;
+        // `false` keeps this non-blocking because the event is signalled.
+        match unsafe {
+            GetOverlappedResult(
+                self.transfer_handle,
+                &*pending.overlapped,
+                &mut count,
+                false,
+            )
+        } {
+            Ok(()) => TransferOutcome::Completed,
+            // A cancelled transfer reports this, which still means the buffers
+            // are free.
+            Err(_) => TransferOutcome::Completed,
+        }
+    }
+
+    /// Cancels an in-flight transfer and gives the driver a bounded grace period.
+    ///
+    /// Returns the buffers when the kernel has not completed the operation yet;
+    /// the caller must keep them alive instead of freeing them.
+    fn abandon_transfer(&self, pending: PendingTransfer) -> Option<PendingTransfer> {
+        // SAFETY: cancels exactly the operation identified by this OVERLAPPED.
+        match unsafe { CancelIoEx(self.transfer_handle, Some(&*pending.overlapped)) } {
+            Ok(()) => {}
+            // The operation already completed before the cancel arrived.
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0) => {}
+            Err(error) => eprintln!("CancelIoEx（传输）失败：{error}"),
+        }
+        // SAFETY: bounded wait for the cancellation to be observed.
+        if unsafe { WaitForSingleObject(self.transfer_event, CANCEL_GRACE_MS) } == WAIT_OBJECT_0 {
+            let mut count = 0_u32;
+            // SAFETY: drains the completion so the buffers can be dropped.
+            // A cancelled operation reports ERROR_OPERATION_ABORTED, which is
+            // the expected outcome here rather than a failure.
+            match unsafe {
+                GetOverlappedResult(
+                    self.transfer_handle,
+                    &*pending.overlapped,
+                    &mut count,
+                    false,
+                )
+            } {
+                Ok(()) => {}
+                Err(error) if error.code() == HRESULT::from_win32(ERROR_OPERATION_ABORTED.0) => {}
+                Err(error) => eprintln!("清理已取消的 HID 传输失败：{error}"),
+            }
+            None
+        } else {
+            Some(pending)
+        }
+    }
+
+    /// Runs one bounded feature/output transfer on the overlapped handle.
+    ///
+    /// Returns the byte count the driver reported. `None` means the transfer
+    /// failed, timed out, or a previous one is still owned by the driver;
+    /// `last_error` then holds the reason, so callers can tell a timeout apart
+    /// from a request the device simply does not support.
+    fn transfer(&mut self, kind: TransferKind, code: u32, buffer: &mut [u8]) -> Option<u32> {
+        if !self.can_transfer() {
+            return None;
+        }
+        // Only one transfer may be outstanding: the driver owns the buffers of
+        // an abandoned one until it signals completion.
+        if let Some(pending) = self.pending_transfer.take() {
+            match self.reap_transfer(pending) {
+                TransferOutcome::Pending(pending) => {
+                    self.pending_transfer = Some(pending);
+                    self.last_error = 258;
+                    return None;
+                }
+                TransferOutcome::Completed => {}
+            }
+        }
+        let mut pending = PendingTransfer::new(self.transfer_event, buffer.len());
+        pending.buffer.copy_from_slice(buffer);
+        // SAFETY: resets the valid event before starting a new overlapped call.
+        if let Err(error) = unsafe { ResetEvent(self.transfer_event) } {
+            self.last_error = error.code().0 as u32;
+            return None;
+        }
+        let size = buffer.len() as u32;
+        let mut returned = 0_u32;
+        let pointer = pending.buffer.as_mut_ptr().cast::<c_void>();
+        let (output, output_size) = match kind {
+            TransferKind::Send => (None, 0),
+            TransferKind::Receive => (Some(pointer), size),
+        };
+        // SAFETY: `pending.buffer` owns `size` bytes at this stable heap
+        // address and stays alive until the operation completes; `pointer`
+        // points into that same buffer.
+        let immediate = unsafe {
+            DeviceIoControl(
+                self.transfer_handle,
+                code,
+                Some(pointer.cast_const()),
+                size,
+                output,
+                output_size,
+                Some(&mut returned),
+                Some(&mut *pending.overlapped),
+            )
+        };
+        // Report transfers can complete inline: SET_FEATURE does exactly that on
+        // real hardware instead of returning ERROR_IO_PENDING.
+        if immediate.is_ok() {
+            buffer.copy_from_slice(&pending.buffer);
+            return Some(returned);
+        }
+        // SAFETY: read this thread's error immediately after DeviceIoControl.
+        let error = unsafe { GetLastError() };
+        if error != ERROR_IO_PENDING {
+            self.last_error = error.0;
+            return None;
+        }
+        // SAFETY: waits on the transfer's event with a bounded timeout.
+        let status = unsafe { WaitForSingleObject(self.transfer_event, HID_TRANSFER_TIMEOUT_MS) };
+        if status == WAIT_OBJECT_0 {
+            let mut count = 0_u32;
+            // SAFETY: the overlapped structure and counter are still valid.
+            if unsafe {
+                GetOverlappedResult(
+                    self.transfer_handle,
+                    &*pending.overlapped,
+                    &mut count,
+                    false,
+                )
+            }
+            .is_err()
+            {
+                self.remember_error();
+                return None;
+            }
+            buffer.copy_from_slice(&pending.buffer);
+            return Some(count);
+        }
+        // Timeout or wait failure: cancel, then keep the buffers if the driver
+        // has not completed yet. They stay reachable through the device.
+        if let Some(pending) = self.abandon_transfer(pending) {
+            self.pending_transfer = Some(pending);
+        }
+        self.last_error = ERROR_TIMEOUT.0;
+        None
+    }
+}
+
+/// Result of checking a pending overlapped transfer without blocking.
+enum TransferOutcome {
+    /// The operation finished and its buffers can be released.
+    Completed,
+    /// The driver still owns the buffers; they must not be freed.
+    Pending(PendingTransfer),
 }
 
 impl Drop for WindowsHidDevice {
@@ -415,10 +669,8 @@ impl Drop for WindowsHidDevice {
         if let Some(pending) = self.pending.take() {
             if !self.read_handle.is_invalid() && !self.event.is_invalid() {
                 // SAFETY: cancels only the operation this device started.
-                if let Err(error) =
-                    // SAFETY: cancels only the operation this device started.
-                    unsafe { CancelIoEx(self.read_handle, Some(&*pending.overlapped)) }
-                {
+                let cancelled = unsafe { CancelIoEx(self.read_handle, Some(&*pending.overlapped)) };
+                if let Err(error) = cancelled {
                     eprintln!("关闭时取消 HID 读请求失败：{error}");
                 }
                 // SAFETY: bounded wait so shutdown cannot hang on a stuck driver.
@@ -431,6 +683,26 @@ impl Drop for WindowsHidDevice {
                 }
             }
         }
+        if let Some(pending) = self.pending_transfer.take() {
+            if !self.transfer_handle.is_invalid() && !self.transfer_event.is_invalid() {
+                // SAFETY: cancels only the transfer this device started; the
+                // overlapped buffer outlives the call.
+                let cancelled =
+                    unsafe { CancelIoEx(self.transfer_handle, Some(&*pending.overlapped)) };
+                if let Err(error) = cancelled {
+                    eprintln!("关闭时取消失败的 HID 传输：{error}");
+                }
+                // SAFETY: bounded wait so shutdown cannot hang on a stuck driver.
+                if unsafe { WaitForSingleObject(self.transfer_event, CANCEL_GRACE_MS) }
+                    != WAIT_OBJECT_0
+                {
+                    eprintln!("HID 传输在关闭时仍未完成，保留缓冲区以避免悬垂写入");
+                    let _leaked = Box::leak(Box::new(pending));
+                }
+            }
+        }
+        close_handle(self.transfer_event);
+        close_handle(self.transfer_handle);
         close_handle(self.event);
         close_handle(self.read_handle);
         close_handle(self.write_handle);
@@ -449,6 +721,19 @@ impl HidDevice for WindowsHidDevice {
         }
         let mut buffer = vec![0_u8; size];
         buffer[..data.len()].copy_from_slice(data);
+        if self.can_transfer() {
+            if self
+                .transfer(TransferKind::Send, IOCTL_HID_SET_FEATURE, &mut buffer)
+                .is_some()
+            {
+                return Ok(true);
+            }
+            // Anything but "this device does not implement the IOCTL" is a real
+            // failure; retrying synchronously would block without a bound.
+            if self.last_error != ERROR_INVALID_FUNCTION.0 {
+                return Ok(false);
+            }
+        }
         // SAFETY: buffer is writable for exactly `size` bytes and is not retained.
         let ok =
             unsafe { HidD_SetFeature(self.write_handle, buffer.as_mut_ptr().cast(), size as u32) };
@@ -467,6 +752,19 @@ impl HidDevice for WindowsHidDevice {
         }
         let mut buffer = vec![0_u8; size];
         buffer[0] = report_id;
+        if self.can_transfer() {
+            // The IOCTL takes the report ID in the input buffer and lets the
+            // driver fill the very same buffer, so `buffer` is both.
+            if self
+                .transfer(TransferKind::Receive, IOCTL_HID_GET_FEATURE, &mut buffer)
+                .is_some()
+            {
+                return Ok(Some(buffer));
+            }
+            if self.last_error != ERROR_INVALID_FUNCTION.0 {
+                return Ok(None);
+            }
+        }
         // SAFETY: buffer has `size` writable bytes and report ID is initialized.
         let ok =
             unsafe { HidD_GetFeature(self.write_handle, buffer.as_mut_ptr().cast(), size as u32) };
@@ -488,6 +786,17 @@ impl HidDevice for WindowsHidDevice {
         }
         let mut buffer = vec![0_u8; size];
         buffer[..data.len()].copy_from_slice(data);
+        if self.can_transfer() {
+            if self
+                .transfer(TransferKind::Send, IOCTL_HID_SET_OUTPUT_REPORT, &mut buffer)
+                .is_some()
+            {
+                return Ok(true);
+            }
+            if self.last_error != ERROR_INVALID_FUNCTION.0 {
+                return Ok(false);
+            }
+        }
         let mut written = 0_u32;
         // SAFETY: buffer is readable for `size` bytes; synchronous handle means
         // no OVERLAPPED pointer is required.

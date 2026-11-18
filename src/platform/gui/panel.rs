@@ -17,8 +17,12 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Maximum number of device cards shown in the compact panel.
-const MAX_CARDS: usize = 12;
+/// Maximum number of device cards the panel can show. Matches the number of
+/// devices a config file may hold, so no enabled device is left out; when the
+/// grid does not fit the window the cards scroll with the mouse wheel.
+const MAX_CARDS: usize = crate::profiles::MAX_PROFILES;
+/// Wheel notch reported by Windows; one notch scrolls one card row.
+const WHEEL_STEP: i32 = 120;
 /// How often an open panel checks the tray's published snapshot.
 const SUBSCRIBE_INTERVAL_MS: u32 = 1500;
 /// Older snapshots are ignored (for example left over after a tray crash).
@@ -112,6 +116,8 @@ pub fn run() -> Result<()> {
         status,
         cards,
         card_keys: vec![None; MAX_CARDS],
+        card_active: vec![false; MAX_CARDS],
+        scroll_rows: 0,
         notice,
         timer,
         store,
@@ -129,10 +135,10 @@ pub fn run() -> Result<()> {
         let weak: Weak<RefCell<PanelState>> = Rc::downgrade(&state);
         let handler = nwg::full_bind_event_handler(
             &state.borrow().window.handle,
-            move |event, _data, handle| {
+            move |event, data, handle| {
                 if let Some(state) = weak.upgrade() {
                     if let Ok(mut state) = state.try_borrow_mut() {
-                        state.on_event(event, handle);
+                        state.on_event(event, data, handle);
                     }
                 }
             },
@@ -172,6 +178,10 @@ struct PanelState {
     status: nwg::Label,
     cards: Vec<nwg::Button>,
     card_keys: Vec<Option<String>>,
+    // Whether a slot currently carries a reading; layout decides visibility so
+    // that scrolling and the "no device" case cannot fight over `set_visible`.
+    card_active: Vec<bool>,
+    scroll_rows: usize,
     notice: nwg::Notice,
     timer: nwg::Timer,
     // Kept alive so the layouts stay bound to the window for its lifetime.
@@ -188,17 +198,14 @@ struct PanelState {
 }
 
 impl PanelState {
-    /// Single source of geometry for the panel: toolbar, stretching list and
-    /// status line. Re-run on every resize.
     /// Single source of geometry for the panel: toolbar, a responsive grid of
     /// device cards and a compact hint on the toolbar. Re-run on every resize.
-    fn apply_layout(&self) {
+    fn apply_layout(&mut self) {
         let (width, _) = self.window.size();
         let scale = crate::platform::gui::ui_scale();
         let width = (width as f64 / scale).round() as u32;
         let width = width.max(620);
         let pad = 18_u32;
-        let content_w = width.saturating_sub(pad * 2);
 
         let mut x = pad as i32;
         let y = 12_i32;
@@ -217,24 +224,84 @@ impl PanelState {
         let hint_w = (width as i32 - x - pad as i32).max(80) as u32;
         crate::place!(self.status, x, y + 4, hint_w, 22);
 
+        self.layout_cards();
+        crate::platform::gui::theme::polish(&self.window);
+    }
+
+    /// Places the cards in a grid and shows only the rows the window can hold;
+    /// devices past that stay reachable by scrolling the wheel.
+    fn layout_cards(&mut self) {
+        let (width, height) = self.window.size();
+        let scale = crate::platform::gui::ui_scale();
+        let width = ((width as f64 / scale).round() as u32).max(620);
+        let height = (height as f64 / scale).round() as u32;
+        let pad = 18_u32;
+        let content_w = width.saturating_sub(pad * 2);
         let gap = 14_u32;
         let card_h = 100_u32;
         let min_card_w = 220_u32;
         let columns = ((content_w + gap) / (min_card_w + gap)).clamp(1, 4);
         let card_w = content_w.saturating_sub(gap * (columns - 1)) / columns;
-        let top = (y + 30 + 14) as u32;
+        let top = 30 + 12 + 14;
+        let available = height.saturating_sub(top + pad);
+        let rows_visible = ((available + gap) / (card_h + gap)).max(1);
+        let max_scroll = self
+            .rows_used(columns)
+            .saturating_sub(rows_visible as usize);
+        self.scroll_rows = self.scroll_rows.min(max_scroll);
         for (index, card) in self.cards.iter().enumerate() {
             let column = (index % columns as usize) as u32;
-            let row = (index / columns as usize) as u32;
+            let row = index / columns as usize;
+            let offset = row.saturating_sub(self.scroll_rows) as u32;
             let card_x = pad + column * (card_w + gap);
-            let card_y = top + row * (card_h + gap);
+            let card_y = top + offset * (card_h + gap);
             crate::place!(card, card_x as i32, card_y as i32, card_w, card_h);
+            let filled = self.card_active.get(index).copied().unwrap_or(false);
+            card.set_visible(
+                filled && row >= self.scroll_rows && row < self.scroll_rows + rows_visible as usize,
+            );
         }
-        crate::platform::gui::theme::polish(&self.window);
     }
 
-    fn on_event(&mut self, event: nwg::Event, handle: nwg::ControlHandle) {
-        if handle == self.notice.handle && event == nwg::Event::OnNotice {
+    /// Number of grid rows needed for the slots that currently hold a reading.
+    fn rows_used(&self, columns: u32) -> usize {
+        let columns = columns.max(1) as usize;
+        self.card_active
+            .iter()
+            .rposition(|active| *active)
+            .map_or(0, |index| index / columns + 1)
+    }
+
+    /// Scrolls the card grid by whole rows. Windows reports a positive delta
+    /// when the wheel turns away from the user, which reveals earlier devices.
+    fn scroll_cards(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        let notches = delta / WHEEL_STEP;
+        let steps = if notches == 0 {
+            delta.signum()
+        } else {
+            notches
+        };
+        let before = self.scroll_rows;
+        let distance = steps.unsigned_abs() as usize;
+        if steps > 0 {
+            self.scroll_rows = self.scroll_rows.saturating_sub(distance);
+        } else {
+            self.scroll_rows = self.scroll_rows.saturating_add(distance);
+        }
+        if self.scroll_rows != before {
+            self.layout_cards();
+        }
+    }
+
+    fn on_event(&mut self, event: nwg::Event, data: nwg::EventData, handle: nwg::ControlHandle) {
+        if event == nwg::Event::OnMouseWheel {
+            if let nwg::EventData::OnMouseWheel(delta) = data {
+                self.scroll_cards(delta);
+            }
+        } else if handle == self.notice.handle && event == nwg::Event::OnNotice {
             self.drain_readings();
             if self.reload_pending.swap(false, Ordering::AcqRel) {
                 self.request_refresh();
@@ -435,17 +502,22 @@ impl PanelState {
                     kind
                 );
                 card.set_text(&text);
-                card.set_visible(true);
                 if let Some(slot) = self.card_keys.get_mut(index) {
                     *slot = Some(reading.key.clone());
                 }
+                if let Some(active) = self.card_active.get_mut(index) {
+                    *active = true;
+                }
             } else {
-                card.set_visible(false);
                 if let Some(slot) = self.card_keys.get_mut(index) {
                     *slot = None;
                 }
+                if let Some(active) = self.card_active.get_mut(index) {
+                    *active = false;
+                }
             }
         }
+        self.layout_cards();
         // The old "已读取 X/Y 台设备" bottom line is intentionally gone; this
         // toolbar hint only carries transient messages.
         self.status.set_text(if readings.is_empty() {
