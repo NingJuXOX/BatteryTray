@@ -22,7 +22,7 @@
 
 ### 直接运行（已编译版本）
 
-从 [GitHub Releases](https://github.com/xiangzhaoxicao-crypto/BatteryTray/releases/latest) 下载 `BatteryTray-<版本>-x64.exe`，放到任意目录双击即可：单文件、免安装、不需要管理员权限，也没有后台服务或自动更新。想自己构建请看下一节。
+从 [GitHub Releases](https://github.com/NingJuXOX/BatteryTray/releases/latest) 下载 `BatteryTray-<版本>-x64.exe`，放到任意目录双击即可：单文件、免安装、不需要管理员权限，也没有后台服务或自动更新。想自己构建请看下一节。
 
 > **首次运行会有 SmartScreen 提示**：exe 未做代码签名，Windows 会弹出「Windows 已保护你的电脑」。点「更多信息」→「仍要运行」即可放行；若下载后直接被拦，右键文件 →「属性」→ 勾选「解除锁定」→ 确定。这是未签名程序的正常现象，不代表检出病毒，彻底消除需要购买代码签名证书。
 
