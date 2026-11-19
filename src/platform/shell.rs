@@ -10,11 +10,11 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
 };
 use windows::Win32::UI::Shell::{
-    FOLDERID_Desktop, FOLDERID_Startup, IShellLinkW, SHGetKnownFolderPath, ShellLink,
-    KF_FLAG_DEFAULT, SLGP_RAWPATH,
+    FOLDERID_Desktop, FOLDERID_Startup, IShellLinkW, SHGetKnownFolderPath, ShellExecuteW,
+    ShellLink, KF_FLAG_DEFAULT, SLGP_RAWPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOWNORMAL,
 };
 
 /// Application display name used for this build's shortcuts.
@@ -34,6 +34,12 @@ pub const PANEL_TITLE: &str = "电量托盘 · 简洁面板";
 pub const EDITOR_TITLE: &str = "电量托盘 · 设备";
 /// HID debugger window title.
 pub const DEBUG_TITLE: &str = "电量托盘 · 调试版";
+/// Title of the about window.
+pub const ABOUT_TITLE: &str = "电量托盘 · 关于";
+/// Repository shown in the about window.
+pub const PROJECT_URL: &str = "https://github.com/NingJuXOX/BatteryTray";
+/// One-paragraph pitch shown in the about window.
+pub const ABOUT_SUMMARY: &str = "通过 USB HID 只读查询无线鼠标、耳机等外设的电量，\n结果显示在系统托盘图标和深色简洁面板里。单文件 exe，\n不需要 Python、.NET 或常驻后台服务。";
 
 fn wide(text: impl AsRef<str>) -> Vec<u16> {
     text.as_ref()
@@ -60,6 +66,32 @@ impl Drop for ComApartment {
         // SAFETY: balances the successful CoInitializeEx on this same thread.
         unsafe { CoUninitialize() };
     }
+}
+
+/// Opens an absolute URL with the user's default browser.
+pub fn open_url(url: &str) -> Result<()> {
+    let url = wide(url);
+    // SAFETY: `url` is NUL terminated and stays alive for the whole call; no
+    // window owns the navigation, so the shell hands it to the default
+    // browser and returns immediately.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR::null(),
+            PCWSTR(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW reports values above 32 on success.
+    if result.0 as isize <= 32 {
+        return Err(BatteryTrayError::Shell(format!(
+            "无法打开链接（ShellExecuteW 返回 {}）",
+            result.0 as isize
+        )));
+    }
+    Ok(())
 }
 
 /// Restores and focuses a top-level window with an exact title.

@@ -14,6 +14,7 @@
 - **新增设备向导**：AI 分析 / JSON 导入两条路径，都要求「先实测读到电量，才允许保存」，避免把猜出来的协议写进配置。
 - **托盘唯一数据源**：托盘负责读设备并发布读数快照，面板只订阅快照，避免两个进程同时抢同一接收器；托盘退出后面板自动回退到本地读取。
 - **深色自绘界面**：圆角按钮、开关、图标按钮均由 GDI 自绘，支持 Per-Monitor V2 DPI 感知，高缩放不模糊。
+- **关于窗口**：面板右上角「关于」按钮打开，显示应用图标、版本、一句话简介与 GitHub 项目地址，点「打开项目主页」直接跳浏览器。
 - **命令行接口**：设备枚举、原始报文扫描、协议试跑与写入均可输出 JSON，方便脚本或 AI 助手调用。
 
 ---
@@ -95,6 +96,7 @@ battery-tray.exe --install-desktop
 | `--panel` | 打开简洁面板 |
 | `--editor [--key KEY]` | 打开新增向导；带 `--key` 时直接编辑指定设备 |
 | `--debug-ui` | 打开 HID 调试窗口（枚举接口、读取 Feature/Input、「粘贴并测试」协议 JSON） |
+| `--about` | 打开关于窗口（应用图标、版本、项目地址） |
 | `--catalog` | 输出 JSON：配置、设备与全部 HID 接口 |
 | `--scan --vid 0x1234 --pid 0x5678 [--mi N] [--passive-ms N]` | 只读收集指定设备的原始响应 |
 | `--send --hex "00 20 01" [--mode feature\|output] [--mi N] [--settle-ms N] [--timeout-ms N] [--read-len N]` | 发送一次查询报文并读取响应 |
@@ -219,6 +221,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 | `src/platform/gui/editor.rs` | 新增设备向导，四页流程与协议合并 |
 | `src/platform/gui/theme.rs` | 深色主题、圆角控件与开关的 GDI 自绘 |
 | `src/platform/gui/debug.rs` | HID 调试窗口 |
+| `src/platform/gui/about.rs` | 关于窗口（图标、版本、项目地址） |
 | `src/platform/gui/task.rs` `mod.rs` | 后台任务封装、DPI 与窗口模式分发 |
 | `src/platform/hid.rs` | HID 接口枚举、报文读写、设备锁 |
 | `src/platform/sync.rs` `shell.rs` | 进程单例 / 互斥；快捷方式、开机自启、注册表 |

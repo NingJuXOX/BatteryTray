@@ -55,6 +55,11 @@ pub fn run() -> Result<()> {
         .text("新增")
         .parent(&window)
         .build(&mut add)?;
+    let mut about = nwg::Button::default();
+    nwg::Button::builder()
+        .text("关于")
+        .parent(&window)
+        .build(&mut about)?;
     let mut interval_label = nwg::Label::default();
     nwg::Label::builder()
         .text("刷新间隔")
@@ -111,6 +116,7 @@ pub fn run() -> Result<()> {
         window,
         refresh,
         add,
+        about,
         interval_label,
         interval,
         autostart,
@@ -173,6 +179,7 @@ struct PanelState {
     window: nwg::Window,
     refresh: nwg::Button,
     add: nwg::Button,
+    about: nwg::Button,
     interval_label: nwg::Label,
     interval: nwg::ComboBox<String>,
     autostart: Toggle,
@@ -222,7 +229,12 @@ impl PanelState {
         x += 108 + 16;
         crate::place!(self.autostart.button, x, y + 2, 104, 26);
         x += 104 + 12;
-        let hint_w = (width as i32 - x - pad as i32).max(80) as u32;
+        // The about button is pinned to the right edge; the hint takes what is
+        // left between the toolbar and that button.
+        let about_w = 64_i32;
+        let about_x = width as i32 - pad as i32 - about_w;
+        crate::place!(self.about, about_x, y, about_w, 30);
+        let hint_w = (about_x - x - 8).max(80) as u32;
         crate::place!(self.status, x, y + 4, hint_w, 22);
 
         self.layout_cards();
@@ -311,6 +323,8 @@ impl PanelState {
             self.request_refresh();
         } else if handle == self.add.handle && event == nwg::Event::OnButtonClick {
             self.launch_editor(None);
+        } else if handle == self.about.handle && event == nwg::Event::OnButtonClick {
+            self.launch_about();
         } else if handle == self.autostart.button.handle && event == nwg::Event::OnButtonClick {
             self.toggle_autostart();
         } else if handle == self.interval.handle && event == nwg::Event::OnComboxBoxSelection {
@@ -365,6 +379,20 @@ impl PanelState {
             Err(error) => self
                 .status
                 .set_text(&format!("打开添加设备窗口失败：{error}")),
+        }
+    }
+
+    /// Opens the about window; it reads the same icon resource as this panel.
+    fn launch_about(&mut self) {
+        let Ok(executable) = std::env::current_exe() else {
+            self.status.set_text("无法定位程序自身路径。");
+            return;
+        };
+        if let Err(error) = std::process::Command::new(executable)
+            .arg("--about")
+            .spawn()
+        {
+            self.status.set_text(&format!("打开关于窗口失败：{error}"));
         }
     }
 

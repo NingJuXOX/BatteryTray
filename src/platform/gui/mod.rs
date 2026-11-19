@@ -1,5 +1,6 @@
 //! Native Windows panels: compact battery list, add-device wizard and HID debugger.
 
+mod about;
 mod debug;
 mod editor;
 mod panel;
@@ -16,6 +17,10 @@ pub fn run() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if let Some(code) = crate::device_api::run_command(&arguments) {
         std::process::exit(code);
+    }
+    if arguments.iter().any(|item| item == "--about") {
+        about::run()?;
+        return Ok(());
     }
     if arguments.iter().any(|item| item == "--panel") {
         panel::run()
@@ -169,6 +174,38 @@ pub(crate) fn apply_window_icon(window: &nwg::Window) {
                 LPARAM(handle.0 as isize),
             );
         }
+    }
+}
+
+/// Loads the embedded application icon at the given pixel size.
+///
+/// The handle is owned by the resource section (`LR_SHARED`), so callers must
+/// not destroy it. Returns `None` when the build has no icon resource or the
+/// requested rung is missing.
+pub(crate) fn app_icon(size: u32) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        LoadImageW, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED,
+    };
+
+    // SAFETY: the module handle names this executable, and `LR_SHARED` returns
+    // a borrowed handle that stays valid for the lifetime of the process.
+    unsafe {
+        let module = GetModuleHandleW(None).ok()?;
+        let handle = LoadImageW(
+            HINSTANCE(module.0),
+            PCWSTR(APP_ICON_RESOURCE_ID as usize as *const u16),
+            IMAGE_ICON,
+            size as i32,
+            size as i32,
+            LR_DEFAULTCOLOR | LR_SHARED,
+        )
+        .ok()?;
+        if handle.0.is_null() {
+            return None;
+        }
+        Some(HICON(handle.0))
     }
 }
 

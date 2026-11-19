@@ -15,6 +15,9 @@ pub const PANEL_MUTEX_NAME: &str = "Local\\BatteryTray.Panel";
 pub const EDITOR_MUTEX_NAME: &str = "Local\\BatteryTray.Editor";
 /// HID debugger single-instance mutex name.
 pub const DEBUG_MUTEX_NAME: &str = "Local\\BatteryTray.Debug";
+/// Guards the about window so it never opens twice.
+pub const ABOUT_MUTEX_NAME: &str = "Local\\BatteryTray.About";
+
 /// Cross-process configuration write mutex name.
 pub const CONFIG_MUTEX_NAME: &str = "Local\\BatteryTray_Config_v1";
 /// Prefix for per-device HID locks.
