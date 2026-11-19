@@ -1214,8 +1214,12 @@ pub fn polish(window: &nwg::Window) {
                 "SysListView32" | "Edit" => true,
                 // Only plain/def push buttons (low nibble 0 or 1) become
                 // owner-drawn and rounded; radio buttons and group boxes keep
-                // their native rendering.
-                "Button" => matches!(style & 0x0F, 0 | 1),
+                // their native rendering. BS_OWNERDRAW (0x0B) is listed as well
+                // because polish() runs again on every resize: after the first
+                // pass converted the button, the style read here is the
+                // converted one, and a region built once from the creation-time
+                // size would clip clicks on everything the button grew into.
+                "Button" => matches!(style & 0x0F, 0 | 1 | 0x0B),
                 _ => false,
             };
             if name == "Button" {
