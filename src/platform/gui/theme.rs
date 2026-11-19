@@ -11,10 +11,10 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    FillRect, FillRgn, GetWindowDC, InvalidateRect, LineTo, MoveToEx, ReleaseDC, SelectObject,
-    SetBkColor, SetBkMode, SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, DRAW_TEXT_FORMAT, HBRUSH, HDC, HFONT, HGDIOBJ, OPAQUE, PS_SOLID, SRCCOPY,
-    TRANSPARENT,
+    FillRect, FillRgn, GetWindowDC, InvalidateRect, LineTo, MoveToEx, RedrawWindow, ReleaseDC,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DIB_RGB_COLORS, DRAW_TEXT_FORMAT, HBRUSH, HDC, HFONT, HGDIOBJ, OPAQUE, PS_SOLID,
+    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -1134,7 +1134,9 @@ pub fn polish(window: &nwg::Window) {
         use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
         use windows::Win32::UI::Controls::SetWindowTheme;
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetClassNameW, GetWindowLongW, GetWindowRect, SendMessageW, SetWindowLongW, GWL_STYLE,
+            GetClassNameW, GetWindowLongW, GetWindowRect, SendMessageW, SetWindowLongW,
+            SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_NOZORDER,
         };
 
         // SAFETY: child is a live HWND supplied by EnumChildWindows; all GDI
@@ -1236,6 +1238,20 @@ pub fn polish(window: &nwg::Window) {
                 if SetWindowRgn(child, region, BOOL(1)) == 0 {
                     eprintln!("设置圆角区域失败：{name}");
                 }
+                // SetWindowRgn() clips the child's *future* painting only. A
+                // control that was just moved or un-hidden has already painted
+                // itself with the old, larger shape, and the leftover pixels
+                // show up as a half-rounded button until something else
+                // repaints it. SWP_FRAMECHANGED re-applies the region now.
+                _ = SetWindowPos(
+                    child,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
             }
         }
         BOOL(1)
@@ -1250,9 +1266,17 @@ pub fn polish(window: &nwg::Window) {
         }
         // Reshaping a child clips its *future* painting only: the light system
         // frame it drew before the region existed would stay on screen at the
-        // clipped corners forever. Forcing a full repaint of the window lets
-        // the (dark) background paint over those leftover pixels.
-        _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, BOOL(1));
+        // clipped corners forever, and a control that moved while hidden keeps
+        // whatever it painted at its old position. InvalidateRect() on the
+        // parent leaves that to the message loop, so a freshly laid-out page
+        // is briefly wrong; RDW_ALLCHILDREN | RDW_UPDATENOW repaints every
+        // child synchronously before this function returns.
+        _ = RedrawWindow(
+            hwnd,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
     }
 }
 
