@@ -1,12 +1,9 @@
 use crate::config::ConfigStore;
 use crate::error::{BatteryTrayError, Result};
 use crate::profiles::{enabled_profiles, DeviceProfile};
-use crate::protocol::{
-    build_darkrim_request, decode_generic_response, parse_darkrim_frame, parse_hex, Reading,
-    ReadingStatus, DARKRIM_CMD_DONGLE_STATUS, DARKRIM_OP_READ,
-};
+use crate::protocol::{decode_generic_response, parse_hex, Reading, ReadingStatus};
 use chrono::{DateTime, Local};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -491,11 +488,8 @@ impl<B: HidBackend> BatteryReader<B> {
             }
         };
         let _lock = lock;
-        // Calibration is shared by every protocol in this refresh; load it
-        // once here instead of once per protocol handler (and once per retry).
-        let calibration = self.config.calibration();
         self.device_error.clear();
-        let first = self.dispatch(profile, interfaces, &calibration);
+        let first = self.dispatch(profile, interfaces);
         if first.status != ReadingStatus::Error {
             return self.with_cached_percent(first);
         }
@@ -516,20 +510,26 @@ impl<B: HidBackend> BatteryReader<B> {
             );
         }
         self.device_error.clear();
-        let retried = self.dispatch(profile, interfaces, &calibration);
+        let retried = self.dispatch(profile, interfaces);
         self.with_cached_percent(retried)
     }
 
     /// Remembers a fresh percentage, and fills in the previous one otherwise.
     ///
-    /// The status stays truthful — 「休眠」, 「离线」, 「错误」 still say what the hardware
-    /// did — but the number no longer disappears, and the message states how old
-    /// it is.
+    /// The number no longer disappears while a 2.4G device parks its radio: the
+    /// receiver keeps answering and reports the device as asleep, so the last
+    /// reading is shown again with a note saying how old it is. That case is
+    /// downgraded from 「离线」 to 「休眠」 as well — an idle device is not a failed
+    /// read, and it must not count towards the failure streak that pauses
+    /// automatic refreshing.
     fn with_cached_percent(&self, mut reading: Reading) -> Reading {
         let Ok(mut cache) = self.reading_cache.lock() else {
             return reading;
         };
-        if matches!(reading.status, ReadingStatus::Ok | ReadingStatus::Charging) {
+        if matches!(
+            reading.status,
+            ReadingStatus::Ok | ReadingStatus::Charging | ReadingStatus::Sleeping
+        ) {
             if let Some(percent) = reading.percent {
                 cache.remember(&reading.key, percent, reading.updated);
             }
@@ -543,6 +543,9 @@ impl<B: HidBackend> BatteryReader<B> {
         };
         reading.percent = Some(percent);
         reading.updated = updated;
+        if reading.status == ReadingStatus::Offline {
+            reading.status = ReadingStatus::Sleeping;
+        }
         let note = format!("显示 {}前的读数", age_text(age));
         reading.message = if reading.message.trim().is_empty() {
             note
@@ -558,23 +561,8 @@ impl<B: HidBackend> BatteryReader<B> {
         reading
     }
 
-    fn dispatch(
-        &mut self,
-        profile: &DeviceProfile,
-        interfaces: &[HidInterface],
-        calibration: &Map<String, Value>,
-    ) -> Reading {
+    fn dispatch(&mut self, profile: &DeviceProfile, interfaces: &[HidInterface]) -> Reading {
         match profile.protocol.as_str() {
-            "vk_mouse" => {
-                let mut reading = self.read_mouse(profile, interfaces, calibration);
-                reading.name = profile.name.clone();
-                reading
-            }
-            "darkrim" => {
-                let mut reading = self.read_headphone(profile, interfaces, calibration);
-                reading.name = profile.name.clone();
-                reading
-            }
             "hid_feature" | "hid_output_input" => self.read_generic(profile, interfaces),
             protocol => Reading::new(
                 profile,
@@ -583,297 +571,6 @@ impl<B: HidBackend> BatteryReader<B> {
                 format!("不支持的协议：{protocol}"),
             ),
         }
-    }
-
-    fn read_mouse(
-        &mut self,
-        profile: &DeviceProfile,
-        interfaces: &[HidInterface],
-        calibration: &Map<String, Value>,
-    ) -> Reading {
-        let matches = matching_interfaces(profile, interfaces);
-        let Some(interface) = matches.first() else {
-            return Reading::new(
-                profile,
-                None,
-                ReadingStatus::NotFound,
-                "未找到鼠标接收器，请插好 2.4G 接收器",
-            );
-        };
-        let battery_index = calibration_index(calibration, "mouse_battery_index", 2, 63);
-        let device_index = calibration_index(calibration, "mouse_device_index", 2, 255) as u8;
-        let mut device = match self.open_interface(
-            interface,
-            OpenOptions {
-                write: true,
-                read: false,
-            },
-        ) {
-            Ok(device) => device,
-            Err(error) => {
-                return Reading::new(
-                    profile,
-                    None,
-                    ReadingStatus::Error,
-                    format!("无法打开鼠标控制接口（{error}）"),
-                )
-            }
-        };
-        let mut frame = vec![0_u8; usize::from(interface.feature_len).max(2)];
-        frame[1] = 0xF7;
-        match device.set_feature(&frame) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Reading::new(
-                    profile,
-                    None,
-                    ReadingStatus::Error,
-                    format!("鼠标接口写入失败（错误 {}）", device.last_error()),
-                )
-            }
-            Err(error) => {
-                return Reading::new(
-                    profile,
-                    None,
-                    ReadingStatus::Error,
-                    format!("鼠标接口写入失败：{error}"),
-                )
-            }
-        }
-        std::thread::sleep(Duration::from_millis(u64::from(profile.request.settle_ms)));
-        let response = match device.get_feature(profile.request.read_len.checked_into(), 0) {
-            Ok(response) => response,
-            Err(error) => {
-                return Reading::new(
-                    profile,
-                    None,
-                    ReadingStatus::Error,
-                    format!("读取鼠标 Feature 失败：{error}"),
-                )
-            }
-        };
-        if self.debug {
-            eprintln!("[mouse] F7 -> {response:?}");
-        }
-        let Some(response) = response.filter(|data| data.len() >= 10) else {
-            return self.mouse_sleeping(profile);
-        };
-        let data = &response[1..];
-        if data.len() < 9 || !data.iter().take(10).any(|byte| *byte != 0) {
-            return self.mouse_sleeping(profile);
-        }
-        if !matches!(data[6], 0 | 3) && data[6] != device_index {
-            return self.mouse_sleeping(profile);
-        }
-        let online = data[4] == 0;
-        if !online {
-            // The receiver keeps answering with the last level it saw even
-            // after the mouse parks its radio, so that frame is still worth
-            // showing. The status stays 「休眠」: the mouse did not answer,
-            // and an idle device must not count towards the failure streak.
-            let reported = data
-                .get(battery_index)
-                .copied()
-                .filter(|value| (1..=100).contains(value));
-            if let Some(percent) = reported {
-                let updated = Local::now();
-                if let Ok(mut cache) = self.reading_cache.lock() {
-                    cache.remember(&profile.key, percent, updated);
-                }
-                let mut reading = Reading::new(
-                    profile,
-                    Some(percent),
-                    ReadingStatus::Sleeping,
-                    "鼠标休眠中，显示接收器报告的最后电量",
-                );
-                reading.source = "HID Feature 0xF7".to_owned();
-                reading.updated = updated;
-                reading
-                    .detail
-                    .insert("online".to_owned(), Value::from(false));
-                reading.detail.insert(
-                    "raw".to_owned(),
-                    Value::from(crate::protocol::hex_dump(&response)),
-                );
-                return reading;
-            }
-            let mut reading = Reading::new(
-                profile,
-                None,
-                ReadingStatus::Offline,
-                "鼠标已关机或未连接到接收器",
-            );
-            reading.source = "HID Feature 0xF7".to_owned();
-            reading
-                .detail
-                .insert("online".to_owned(), Value::from(false));
-            reading.detail.insert(
-                "raw".to_owned(),
-                Value::from(crate::protocol::hex_dump(&response)),
-            );
-            return reading;
-        }
-        let percent = data
-            .get(battery_index)
-            .copied()
-            .filter(|value| (1..=100).contains(value));
-        let Some(percent) = percent else {
-            return self.mouse_sleeping(profile);
-        };
-        let updated = Local::now();
-        if let Ok(mut cache) = self.reading_cache.lock() {
-            cache.remember(&profile.key, percent, updated);
-        }
-        let mut reading = Reading::new(profile, Some(percent), ReadingStatus::Ok, "");
-        reading.source = "HID Feature 0xF7".to_owned();
-        reading.updated = updated;
-        reading
-            .detail
-            .insert("online".to_owned(), Value::from(true));
-        reading
-            .detail
-            .insert("can_read".to_owned(), Value::from(data[0] == 1));
-        reading.detail.insert(
-            "raw".to_owned(),
-            Value::from(crate::protocol::hex_dump(&response)),
-        );
-        reading
-    }
-
-    fn mouse_sleeping(&self, profile: &DeviceProfile) -> Reading {
-        let cached = self
-            .reading_cache
-            .lock()
-            .ok()
-            .and_then(|cache| cache.recall(&profile.key));
-        if let Some((percent, updated, age)) = cached {
-            let mut reading = Reading::new(
-                profile,
-                Some(percent),
-                ReadingStatus::Sleeping,
-                format!("鼠标休眠中，显示 {}前的电量", age_text(age)),
-            );
-            reading.source = "HID Feature 0xF7（缓存）".to_owned();
-            reading.updated = updated;
-            reading
-                .detail
-                .insert("cached".to_owned(), Value::from(true));
-            reading
-                .detail
-                .insert("age".to_owned(), Value::from(age.as_secs_f64()));
-            return reading;
-        }
-        Reading::new(
-            profile,
-            None,
-            ReadingStatus::Sleeping,
-            "鼠标休眠中，动一下鼠标再试",
-        )
-    }
-
-    fn read_headphone(
-        &mut self,
-        profile: &DeviceProfile,
-        interfaces: &[HidInterface],
-        calibration: &Map<String, Value>,
-    ) -> Reading {
-        let preferred = matching_interfaces(profile, interfaces);
-        let interface = preferred.first().copied().or_else(|| {
-            interfaces.iter().find(|item| {
-                item.vendor_id == profile.match_.vid
-                    && item.product_id == profile.match_.pid
-                    && item.input_len == 64
-                    && item.output_len == 64
-            })
-        });
-        let Some(interface) = interface else {
-            return Reading::new(
-                profile,
-                None,
-                ReadingStatus::NotFound,
-                "未找到耳机接收器，请插好 USB 接收器",
-            );
-        };
-        let mut device = match self.open_interface(
-            interface,
-            OpenOptions {
-                write: true,
-                read: true,
-            },
-        ) {
-            Ok(device) => device,
-            Err(error) => {
-                return Reading::new(
-                    profile,
-                    None,
-                    ReadingStatus::Error,
-                    format!("无法打开耳机控制接口（{error}）"),
-                )
-            }
-        };
-        let cmd = calibration_index(calibration, "headphone_cmd", 0x27, 0xFF) as u8;
-        let valid_index = calibration_index(calibration, "headphone_valid_index", 4, 63);
-        let level_index = calibration_index(calibration, "headphone_level_index", 5, 63);
-        let frame = match darkrim_query(device.as_mut(), cmd, profile.request.settle_ms, 1000) {
-            Ok(frame) => frame,
-            Err(error) => {
-                return Reading::new(
-                    profile,
-                    None,
-                    ReadingStatus::Error,
-                    format!("读取失败：{error}"),
-                )
-            }
-        };
-        let Some(frame) = frame else {
-            let reachable = match darkrim_query(
-                device.as_mut(),
-                DARKRIM_CMD_DONGLE_STATUS,
-                profile.request.settle_ms,
-                800,
-            ) {
-                Ok(Some(frame)) => frame.payload.first().copied().unwrap_or_default() != 0,
-                _ => false,
-            };
-            return if reachable {
-                Reading::new(
-                    profile,
-                    None,
-                    ReadingStatus::Error,
-                    "接收器在线，但电量命令无响应",
-                )
-            } else {
-                Reading::new(
-                    profile,
-                    None,
-                    ReadingStatus::Offline,
-                    "耳机没开机或未连接（dongle 无响应）",
-                )
-            };
-        };
-        if frame.payload.len() <= valid_index.max(level_index) {
-            return Reading::new(profile, None, ReadingStatus::Error, "电量响应长度异常");
-        }
-        if frame.payload[valid_index] == 0 {
-            return Reading::new(
-                profile,
-                None,
-                ReadingStatus::Offline,
-                "耳机未就绪（接收器无有效电量）",
-            );
-        }
-        let percent = frame.payload[level_index];
-        if percent > 100 {
-            return Reading::new(profile, None, ReadingStatus::Error, "电量值超出范围");
-        }
-        let mut reading = Reading::new(profile, Some(percent), ReadingStatus::Ok, "");
-        reading.source = "DARKRIM 0x27".to_owned();
-        reading.detail.insert(
-            "raw".to_owned(),
-            Value::from(crate::protocol::hex_dump(&frame.payload)),
-        );
-        reading.detail.insert("firmware".to_owned(), Value::Null);
-        reading
     }
 
     fn read_generic(&mut self, profile: &DeviceProfile, interfaces: &[HidInterface]) -> Reading {
@@ -935,7 +632,7 @@ impl<B: HidBackend> BatteryReader<B> {
             let length =
                 (profile.request.read_len > 0).then_some(usize::from(profile.request.read_len));
             return match device.get_feature(length, 0) {
-                Ok(Some(response)) => decode_generic_response(profile, &response),
+                Ok(Some(response)) => decode_with_sleep_fallback(profile, &response),
                 Ok(None) => {
                     Reading::new(profile, None, ReadingStatus::Error, "没有返回 Feature 响应")
                 }
@@ -977,7 +674,7 @@ impl<B: HidBackend> BatteryReader<B> {
                     {
                         continue;
                     }
-                    let reading = decode_generic_response(profile, &data);
+                    let reading = decode_with_sleep_fallback(profile, &data);
                     if matches!(
                         reading.status,
                         ReadingStatus::Ok | ReadingStatus::Charging | ReadingStatus::Offline
@@ -1013,31 +710,34 @@ impl<B: HidBackend> BatteryReader<B> {
     }
 }
 
-trait CheckedInto {
-    fn checked_into(self) -> Option<usize>;
-}
-
-impl CheckedInto for u16 {
-    fn checked_into(self) -> Option<usize> {
-        (self > 0).then_some(usize::from(self))
+/// Decodes a response, but keeps the level a sleeping device still reports.
+///
+/// A 2.4G receiver keeps answering after its device parks the radio, and the
+/// frame it returns still holds the last level it saw — only the "online" (or
+/// "valid") flag flips. Reporting "--" in that case throws away a number the
+/// hardware just handed us, so the offsets are decoded a second time with those
+/// flags ignored and the result is labelled 「休眠」: the device did not answer,
+/// which must not count towards the failure streak either.
+fn decode_with_sleep_fallback(profile: &DeviceProfile, response: &[u8]) -> Reading {
+    let reading = decode_generic_response(profile, response);
+    if reading.status != ReadingStatus::Offline {
+        return reading;
     }
-}
-
-fn calibration_index(
-    calibration: &Map<String, Value>,
-    key: &str,
-    default: usize,
-    maximum: usize,
-) -> usize {
-    let parsed = calibration.get(key).and_then(|value| {
-        value
-            .as_i64()
-            .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
-    });
-    parsed
-        .filter(|value| *value >= 0 && *value <= maximum as i64)
-        .map(|value| value as usize)
-        .unwrap_or(default)
+    let mut relaxed = profile.clone();
+    relaxed.response.online_offset = -1;
+    relaxed.response.online_equals = -1;
+    relaxed.response.valid_offset = -1;
+    relaxed.response.valid_equals = -1;
+    let mut sleeping = decode_generic_response(&relaxed, response);
+    if sleeping.percent.is_none() || sleeping.status != ReadingStatus::Ok {
+        return reading;
+    }
+    sleeping.status = ReadingStatus::Sleeping;
+    sleeping.message = "设备已休眠，显示接收器报告的最后电量".to_owned();
+    sleeping
+        .detail
+        .insert("online".to_owned(), Value::from(false));
+    sleeping
 }
 
 fn select_profiles(profiles: Vec<DeviceProfile>, keys: Option<&[String]>) -> Vec<DeviceProfile> {
@@ -1056,6 +756,37 @@ fn select_profiles(profiles: Vec<DeviceProfile>, keys: Option<&[String]>) -> Vec
                 .collect()
         }
     }
+}
+
+/// Reports whether the enumeration still contains an interface that matches
+/// the profile.
+///
+/// A 2.4G receiver is a USB device of its own, so unplugging it removes every
+/// matching interface even though the profile stays in the config. The tray
+/// uses this to hide the icon instead of leaving a dead 「--」 behind.
+pub fn has_matching_interface(profile: &DeviceProfile, interfaces: &[HidInterface]) -> bool {
+    !matching_interfaces(profile, interfaces).is_empty()
+}
+
+/// Returns whether `interface` is a Bluetooth HID node.
+///
+/// USB devices are enumerated as `\\?\hid#vid_1234&pid_5678&mi_02#...`, while a
+/// Bluetooth node carries a service GUID right after `hid#`
+/// (`\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&...`). Windows drops a
+/// Bluetooth node from the device list as soon as the device sleeps, so its
+/// presence says nothing about whether the hardware is still around.
+pub fn is_bluetooth_interface(interface: &HidInterface) -> bool {
+    match interface.path.to_ascii_lowercase().split_once("hid#") {
+        Some((_, rest)) => rest.starts_with('{'),
+        None => false,
+    }
+}
+
+/// Returns whether any interface matched by `profile` is a Bluetooth node.
+pub fn has_bluetooth_interface(profile: &DeviceProfile, interfaces: &[HidInterface]) -> bool {
+    matching_interfaces(profile, interfaces)
+        .iter()
+        .any(|item| is_bluetooth_interface(item))
 }
 
 fn matching_interfaces<'a>(
@@ -1109,40 +840,6 @@ fn device_lock_key(profile: &DeviceProfile, interfaces: &[HidInterface]) -> Stri
         rules.usage.unwrap_or(0),
         rules.interface_number
     )
-}
-
-fn darkrim_query(
-    device: &mut dyn HidDevice,
-    cmd: u8,
-    settle_ms: u32,
-    timeout_ms: u32,
-) -> Result<Option<crate::protocol::DarkrimFrame>> {
-    let request = build_darkrim_request(cmd, &[])?;
-    if settle_ms > 0 {
-        std::thread::sleep(Duration::from_millis(u64::from(settle_ms)));
-    }
-    if !device.write_output(&request)? {
-        return Ok(None);
-    }
-    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
-    while Instant::now() < deadline {
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .clamp(10, u128::from(u32::MAX)) as u32;
-        let Some(data) = device.read_input(remaining)? else {
-            std::thread::sleep(Duration::from_millis(u64::from(
-                remaining.min(READ_POLL_BACKOFF_MS),
-            )));
-            continue;
-        };
-        if let Some(frame) = parse_darkrim_frame(&data) {
-            if frame.op == DARKRIM_OP_READ && frame.cmd == cmd {
-                return Ok(Some(frame));
-            }
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -1428,15 +1125,33 @@ mod tests {
         );
         let fresh = fresh_reader.read_profile(&profile);
         assert_eq!(fresh.percent, Some(81));
-        let acquired_at = fresh.updated;
-        let mut sleeping_reader =
-            BatteryReader::with_cache(ResponseBackend { response: None }, store, cache);
+        let _acquired_at = fresh.updated;
+        // The receiver still answers after the mouse parks its radio, and the
+        // frame it returns holds the level it last saw with the online flag
+        // flipped. That number must be shown, not thrown away.
+        let mut idle = vec![0_u8; 65];
+        idle[1] = 1;
+        idle[3] = 66;
+        idle[5] = 1;
+        let mut sleeping_reader = BatteryReader::with_cache(
+            ResponseBackend {
+                response: Some(idle),
+            },
+            store.clone(),
+            Arc::clone(&cache),
+        );
         let sleeping = sleeping_reader.read_profile(&profile);
-        assert_eq!(sleeping.percent, Some(81));
+        assert_eq!(sleeping.percent, Some(66));
         assert_eq!(sleeping.status, ReadingStatus::Sleeping);
-        assert_eq!(sleeping.updated, acquired_at);
-        assert!(sleeping.message.contains("显示"));
-        assert!(sleeping.source.contains("缓存"));
+        assert!(sleeping.message.contains("休眠"));
+
+        // Silence after that point falls back to the last level, annotated.
+        let mut silent_reader =
+            BatteryReader::with_cache(ResponseBackend { response: None }, store, cache);
+        let silent = silent_reader.read_profile(&profile);
+        assert_eq!(silent.percent, Some(66));
+        assert_eq!(silent.status, ReadingStatus::Error);
+        assert!(silent.detail.contains_key("cached"));
     }
 
     #[test]

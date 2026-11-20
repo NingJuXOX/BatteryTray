@@ -7,14 +7,13 @@ use crate::platform::shell;
 use crate::platform::sync::{NamedMutex, DEBUG_MUTEX_NAME};
 use crate::protocol::{hex_dump, parse_hex};
 use native_windows_gui as nwg;
-use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Opens the HID debugger and calibration window.
+/// Opens the HID debugger window.
 pub fn run() -> Result<()> {
     let instance = NamedMutex::create(DEBUG_MUTEX_NAME)?;
     if instance.is_none() {
@@ -113,44 +112,6 @@ pub fn run() -> Result<()> {
                 | nwg::TextBoxFlags::AUTOHSCROLL,
         )
         .build(&mut log)?;
-    let calibration = ConfigStore::from_env().calibration();
-    let calibration_value = |key: &str, default: &str| {
-        calibration
-            .get(key)
-            .and_then(Value::as_i64)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| default.to_owned())
-    };
-    let mut cal_label = nwg::Label::default();
-    nwg::Label::builder()
-        .text("手动标定（十进制或 0x 十六进制）")
-        .parent(&window)
-        .build(&mut cal_label)?;
-    let mut mouse_battery = nwg::TextInput::default();
-    nwg::TextInput::builder()
-        .text(&calibration_value("mouse_battery_index", "2"))
-        .parent(&window)
-        .build(&mut mouse_battery)?;
-    let mut mouse_device = nwg::TextInput::default();
-    nwg::TextInput::builder()
-        .text(&calibration_value("mouse_device_index", "2"))
-        .parent(&window)
-        .build(&mut mouse_device)?;
-    let mut headphone_cmd = nwg::TextInput::default();
-    nwg::TextInput::builder()
-        .text(&calibration_value("headphone_cmd", "0x27"))
-        .parent(&window)
-        .build(&mut headphone_cmd)?;
-    let mut headphone_level = nwg::TextInput::default();
-    nwg::TextInput::builder()
-        .text(&calibration_value("headphone_level_index", "5"))
-        .parent(&window)
-        .build(&mut headphone_level)?;
-    let mut save_cal = nwg::Button::default();
-    nwg::Button::builder()
-        .text("保存标定")
-        .parent(&window)
-        .build(&mut save_cal)?;
     let mut status = nwg::Label::default();
     nwg::Label::builder()
         .text("选择左侧接口后可读取 Feature / Input。自定义协议偏移从完整响应第 0 字节开始。")
@@ -171,12 +132,6 @@ pub fn run() -> Result<()> {
         input_read,
         battery,
         import_test,
-        mouse_battery,
-        mouse_device,
-        headphone_cmd,
-        headphone_level,
-        cal_label,
-        save_cal,
         status,
         notice,
         interfaces: Vec::new(),
@@ -259,12 +214,6 @@ struct DebugState {
     input_read: nwg::Button,
     battery: nwg::Button,
     import_test: nwg::Button,
-    mouse_battery: nwg::TextInput,
-    mouse_device: nwg::TextInput,
-    headphone_cmd: nwg::TextInput,
-    headphone_level: nwg::TextInput,
-    cal_label: nwg::Label,
-    save_cal: nwg::Button,
     status: nwg::Label,
     notice: nwg::Notice,
     interfaces: Vec<crate::battery::HidInterface>,
@@ -278,7 +227,7 @@ struct DebugState {
 
 impl DebugState {
     /// Single source of geometry for the debugger: top bar, HID list, request
-    /// rows, log and calibration block. Re-run on every resize.
+    /// rows and log. Re-run on every resize.
     fn apply_layout(&self) {
         let (width, height) = self.window.size();
         let scale = crate::platform::gui::ui_scale();
@@ -301,26 +250,10 @@ impl DebugState {
         let right_x = pad + left_w + 14;
         let right_w = width.saturating_sub(right_x + pad);
         let rxi = right_x as i32;
-        let rwi = right_w as i32;
 
         let status_h = 50_u32;
         let status_y = height.saturating_sub(pad + status_h);
         crate::place!(self.status, rxi, status_y as i32, right_w, status_h);
-
-        let cal_y = status_y.saturating_sub(8 + 26);
-        crate::place!(self.save_cal, rxi + rwi - 88, cal_y as i32, 88, 26);
-        let mut cx = rxi;
-        for (input, w) in [
-            (&self.mouse_battery, 68_u32),
-            (&self.mouse_device, 68),
-            (&self.headphone_cmd, 74),
-            (&self.headphone_level, 74),
-        ] {
-            crate::place!(input, cx, cal_y as i32, w, 26);
-            cx += w as i32 + 6;
-        }
-        let cal_label_y = cal_y.saturating_sub(26);
-        crate::place!(self.cal_label, rxi, cal_label_y as i32, right_w, 22);
 
         let list_top = 50_u32;
         let list_h = height.saturating_sub(pad + list_top);
@@ -351,7 +284,7 @@ impl DebugState {
         crate::place!(self.import_test, rxi + 336, row2 as i32, 120, 28);
 
         let log_top = row2 + 36;
-        let log_bottom = cal_label_y.saturating_sub(12);
+        let log_bottom = status_y.saturating_sub(12);
         crate::place!(
             self.log,
             rxi,
@@ -380,8 +313,6 @@ impl DebugState {
             self.read_batteries();
         } else if handle == self.import_test.handle && event == nwg::Event::OnButtonClick {
             self.import_and_test();
-        } else if handle == self.save_cal.handle && event == nwg::Event::OnButtonClick {
-            self.save_calibration();
         } else if handle == self.notice.handle && event == nwg::Event::OnNotice {
             self.drain_batteries();
         } else if handle == self.window.handle && event == nwg::Event::OnResize {
@@ -715,52 +646,6 @@ impl DebugState {
                 }
                 Err(error) => self.append_log(&format!("读取电量失败：{error}")),
             }
-        }
-    }
-
-    fn save_calibration(&mut self) {
-        let parse = |text: String, name: &str| -> std::result::Result<i64, String> {
-            let text = text.trim().to_owned();
-            if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-                i64::from_str_radix(hex, 16).map_err(|_| format!("{name} 不是有效整数"))
-            } else {
-                text.parse::<i64>()
-                    .map_err(|_| format!("{name} 不是有效整数"))
-            }
-        };
-        let values = (|| -> std::result::Result<Value, String> {
-            let battery = parse(self.mouse_battery.text(), "鼠标电量偏移")?.clamp(0, 63);
-            let device = parse(self.mouse_device.text(), "鼠标通道")?.clamp(0, 255);
-            let cmd = parse(self.headphone_cmd.text(), "耳机命令")?.clamp(0, 255);
-            let level = parse(self.headphone_level.text(), "耳机电量偏移")?.clamp(0, 63);
-            Ok(serde_json::json!({
-                "mouse_battery_index": battery,
-                "mouse_device_index": device,
-                "headphone_cmd": cmd,
-                "headphone_level_index": level,
-            }))
-        })();
-        match values {
-            Ok(new_values) => {
-                let store = ConfigStore::from_env();
-                let mut calibration = serde_json::to_value(store.calibration())
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                if let (Some(target), Some(source)) =
-                    (calibration.as_object_mut(), new_values.as_object())
-                {
-                    for (key, value) in source {
-                        target.insert(key.clone(), value.clone());
-                    }
-                }
-                match store.update([("calibration".to_owned(), calibration)]) {
-                    Ok(()) => {
-                        self.append_log("标定已保存。");
-                        self.status.set_text("标定已保存。");
-                    }
-                    Err(error) => self.status.set_text(&format!("保存标定失败：{error}")),
-                }
-            }
-            Err(error) => self.status.set_text(&error),
         }
     }
 

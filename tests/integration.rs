@@ -134,7 +134,7 @@ fn legacy_config_round_trip_preserves_calibration_and_interval() {
         "calibration": {"mouse_battery_index": 7, "headphone_cmd": 39},
         "devices": [
             {
-                "key": "mouse", "name": "旧鼠标", "protocol": "vk_mouse", "enabled": true,
+                "key": "mouse", "name": "旧鼠标", "protocol": "hid_feature", "enabled": true,
                 "show_in_tray": true, "uid": 1, "icon": "mouse",
                 "match": {"vid": 0x1234, "pid": 0x5678, "usage_page": 0xFFFF, "usage": 2},
                 "request": {"bytes_hex": "00 F7"}, "response": {"battery_offset": 3}

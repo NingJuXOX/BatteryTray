@@ -4,15 +4,6 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// DARKRIM report identifier.
-pub const DARKRIM_REPORT_ID: u8 = 0x4B;
-/// DARKRIM read operation.
-pub const DARKRIM_OP_READ: u8 = 0x80;
-/// DARKRIM battery command.
-pub const DARKRIM_CMD_BATTERY: u8 = 0x27;
-/// DARKRIM dongle status command.
-pub const DARKRIM_CMD_DONGLE_STATUS: u8 = 0x31;
-
 /// Device reading state shared by tray, panel and CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,67 +100,6 @@ impl Reading {
             }
         }
     }
-}
-
-/// A parsed DARKRIM frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DarkrimFrame {
-    /// Operation byte.
-    pub op: u8,
-    /// Command byte.
-    pub cmd: u8,
-    /// Payload bytes.
-    pub payload: Vec<u8>,
-}
-
-/// Builds a padded 64-byte DARKRIM request.
-pub fn build_darkrim_request(cmd: u8, payload: &[u8]) -> Result<Vec<u8>> {
-    if payload.len() > 60 {
-        return Err(BatteryTrayError::Invalid("DARKRIM payload 过长".to_owned()));
-    }
-    let mut frame = vec![0_u8; 64];
-    frame[0] = DARKRIM_REPORT_ID;
-    frame[1] = DARKRIM_OP_READ;
-    frame[2] = cmd;
-    frame[3] = payload.len() as u8;
-    frame[4..4 + payload.len()].copy_from_slice(payload);
-    Ok(frame)
-}
-
-/// Parses a DARKRIM response, accepting frames with or without report ID.
-pub fn parse_darkrim_frame(data: &[u8]) -> Option<DarkrimFrame> {
-    if data.len() < 3 {
-        return None;
-    }
-    let body = if data.first() == Some(&DARKRIM_REPORT_ID) {
-        data.get(1..)?
-    } else {
-        data
-    };
-    if body.len() < 3 {
-        return None;
-    }
-    let length = body[2] as usize;
-    let available = body.get(3..)?.to_vec();
-    let payload = if available.len() >= length {
-        available[..length].to_vec()
-    } else {
-        available
-    };
-    Some(DarkrimFrame {
-        op: body[0],
-        cmd: body[1],
-        payload,
-    })
-}
-
-/// Decodes the standard DARKRIM battery payload.
-pub fn parse_darkrim_battery(payload: &[u8]) -> Option<u8> {
-    if payload.len() < 6 || payload[4] == 0 {
-        return None;
-    }
-    let level = payload[5];
-    (level <= 100).then_some(level)
 }
 
 /// Parses flexible hexadecimal request text.
@@ -319,25 +249,6 @@ pub fn decode_generic_response(profile: &DeviceProfile, response: &[u8]) -> Read
 mod tests {
     use super::*;
     use crate::profiles::custom_profile;
-
-    #[test]
-    fn darkrim_request_and_battery_match_reference() {
-        let request = build_darkrim_request(DARKRIM_CMD_BATTERY, &[]);
-        assert!(request.is_ok());
-        let request = request.unwrap_or_default();
-        assert_eq!(request.len(), 64);
-        assert_eq!(&request[..4], &[0x4B, 0x80, 0x27, 0]);
-        let mut response = request;
-        response[3] = 6;
-        response[4..10].copy_from_slice(&[0, 0, 0, 0, 1, 90]);
-        let frame = parse_darkrim_frame(&response);
-        assert!(frame.is_some());
-        assert_eq!(
-            frame.and_then(|item| parse_darkrim_battery(&item.payload)),
-            Some(90)
-        );
-        assert_eq!(parse_darkrim_battery(&[0; 6]), None);
-    }
 
     #[test]
     fn sixteen_bit_and_bitfield_battery_values_are_decoded() {

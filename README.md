@@ -130,7 +130,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 
 | 文件 | 说明 |
 | --- | --- |
-| `config.json` | 主配置：`interval`（秒）、`devices`（设备数组）、可选的 `calibration`（专用协议的偏移微调） |
+| `config.json` | 主配置：`interval`（秒）、`devices`（设备数组）；早期版本留下的 `calibration` 会被原样保留，程序本身不再使用 |
 | `readings.json` | 托盘发布的读数快照（含递增序号与时间戳），面板订阅它；托盘退出时删除 |
 | `refresh.request` | 面板/外部投递的「请求刷新」标记，托盘每 500 ms 检查一次；与快照一样在托盘退出时清理 |
 | `config.json.corrupt-<时间戳>` | 配置文件损坏时自动备份的原始内容，不会被覆盖 |
@@ -194,7 +194,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 | `request` | `bytes_hex` `settle_ms` `timeout_ms` `feature_len` `read_len` `cmd` | 查询报文（十六进制，含 Report ID）、写后等待、读取超时等 |
 | `response` | `battery_offset` `battery_bytes` `battery_endian` `battery_mask` `battery_shift` `battery_scale` `battery_adjust` `valid_offset` `valid_equals` `online_offset` `online_equals` `charging_offset` `charging_mask` `charging_equals` `report_id` | 从响应中提取电量与状态；**所有偏移都相对包含 Report ID 的完整响应**，`-1` 表示禁用该检查 |
 
-支持的 `protocol`：`vk_mouse`、`darkrim`（两个专用协议，仍保留读取实现），以及通用的 `hid_feature`、`hid_output_input`。前者用固定的查询流程，后两者完全由 `request` / `response` 驱动。新设备推荐走「新增」向导取证，通常得到 `hid_feature` 或 `hid_output_input` 配置。
+支持的 `protocol`：`hid_feature`（写 Feature 报告后读 Feature 报告）与 `hid_output_input`（写 Output 报告后读 Input 报告）。两者都由 `request` / `response` 完全驱动，`request.bytes_hex` 是要发出去的字节，`response` 里的各个偏移决定从哪里取电量、在线标志和充电标志。「新增」向导取证后得到的就是这两种配置之一。
 
 ---
 
@@ -208,6 +208,7 @@ battery-tray.exe --apply-profile device.json --test > applied.json
 - 读取失败只在错误码属于「重试可能成功」时才重试一次（设备未就绪、被占用、超时等），设备不存在或协议不支持不会白跑第二遍。
 - 配置文件与自定义图标的解析结果按 `mtime + size` 缓存：刷新间隔到点、电量百分比变化时不会重复解析同一份 JSON 或同一张 SVG。
 - 新增向导的设备枚举跑在后台线程，UI 线程只负责把结果填进列表，避免 2 秒一次卡顿。
+- 2.4G 接收器被拔掉后，它的托盘图标会自行消失（连续两轮枚举都匹配不到才移除，避免插拔其他 USB 设备时闪一下）；蓝牙设备不适用这条规则——Windows 会在蓝牙设备休眠时直接删除它的 HID 节点，那样「休眠显示最后电量」就失效了。
 - 设备列表为空时托盘仍保留一个通用图标和右键菜单，用于打开面板添加第一台设备；这个占位图标不参与 HID 读取，添加设备后会自动让位。
 
 ## 项目结构
@@ -244,7 +245,7 @@ cargo test
 cargo build --release
 ```
 
-当前有 42 个单元测试 + 6 个集成测试，覆盖配置读写与损坏备份、协议字段归一化、配置与图标的缓存失效、按错误码决定是否重试、并行读取保持配置顺序、快照往返、锁名硬件身份、空配置不注入设备、向导保存落盘等。项目启用了较严格的 lint：禁止 `unwrap` / `expect` / `panic`，所有 `unsafe` 块必须写明安全理由。界面代码依赖真实窗口环境，主要靠手工验证（托盘启动、面板订阅、`--catalog` / `--once`、向导保存）。
+当前有 44 个单元测试 + 6 个集成测试，覆盖配置读写与损坏备份、协议字段归一化、配置与图标的缓存失效、按错误码决定是否重试、并行读取保持配置顺序、休眠时沿用接收器报告的最后电量、接收器拔掉后移除图标且不误伤蓝牙设备、快照往返、锁名硬件身份、空配置不注入设备、向导保存落盘等。项目启用了较严格的 lint：禁止 `unwrap` / `expect` / `panic`，所有 `unsafe` 块必须写明安全理由。界面代码依赖真实窗口环境，主要靠手工验证（托盘启动、面板订阅、`--catalog` / `--once`、向导保存）。
 
 上面四条命令由 `.github/workflows/ci.yml` 在 `windows-latest` 上对每次推送和 PR 自动执行。
 

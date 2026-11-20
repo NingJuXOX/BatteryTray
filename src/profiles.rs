@@ -13,8 +13,7 @@ pub const DEVICES_VERSION: u64 = 1;
 /// Maximum number of configured devices.
 pub const MAX_PROFILES: usize = 32;
 /// Supported protocol identifiers.
-pub const SUPPORTED_PROTOCOLS: &[&str] =
-    &["vk_mouse", "darkrim", "hid_feature", "hid_output_input"];
+pub const SUPPORTED_PROTOCOLS: &[&str] = &["hid_feature", "hid_output_input"];
 /// Generic protocol identifiers.
 pub const CUSTOM_PROTOCOLS: &[&str] = &["hid_feature", "hid_output_input"];
 /// Supported icon identifiers.
@@ -275,7 +274,7 @@ fn absolute_path(text: &str) -> String {
 #[cfg(test)]
 pub(crate) fn sample_profiles() -> Vec<DeviceProfile> {
     let mut mouse = custom_profile("mouse", "测试鼠标", 1);
-    mouse.protocol = "vk_mouse".to_owned();
+    mouse.protocol = "hid_feature".to_owned();
     mouse.icon = "mouse".to_owned();
     mouse.match_ = MatchConfig {
         vid: 0x1234,
@@ -298,7 +297,7 @@ pub(crate) fn sample_profiles() -> Vec<DeviceProfile> {
         ..ResponseConfig::default()
     };
     let mut headphone = custom_profile("headphone", "测试耳机", 2);
-    headphone.protocol = "darkrim".to_owned();
+    headphone.protocol = "hid_output_input".to_owned();
     headphone.icon = "headphone".to_owned();
     headphone.match_ = MatchConfig {
         vid: 0x1234,
@@ -310,7 +309,8 @@ pub(crate) fn sample_profiles() -> Vec<DeviceProfile> {
         ..MatchConfig::default()
     };
     headphone.request = RequestConfig {
-        cmd: Some(0x27),
+        bytes_hex: "4B 80 27 00".to_owned(),
+        settle_ms: 20,
         timeout_ms: 1200,
         ..RequestConfig::default()
     };
