@@ -5,19 +5,22 @@ use crate::error::Result;
 use crate::platform::shell;
 use crate::platform::sync::{NamedMutex, ABOUT_MUTEX_NAME};
 use native_windows_gui as nwg;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
-use windows::Win32::Graphics::Gdi::InvalidateRect;
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongW, SendMessageW, SetWindowLongW, GWL_STYLE,
-};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
 /// Logical window size; `window_size` scales it for the current DPI.
 const WINDOW_WIDTH: i32 = 460;
 const WINDOW_HEIGHT: i32 = 372;
 /// Pixels the application icon is drawn at inside the window.
 const ICON_SIZE: u32 = 64;
+/// Logical position of the icon inside the window.
+const ICON_X: i32 = 24;
+const ICON_Y: i32 = 24;
+/// `SS_ICON`, `SS_CENTERIMAGE`, `STM_SETIMAGE` and `IMAGE_ICON` have no
+/// counterpart in the `windows` crate, which only wraps the messages that need
+/// typed wrappers.
 const SS_ICON: u32 = 0x0003;
-const SS_BITMAP: u32 = 0x000E;
+const SS_CENTERIMAGE: u32 = 0x0200;
 const STM_SETIMAGE: u32 = 0x0172;
 const IMAGE_ICON: u32 = 1;
 
@@ -42,18 +45,9 @@ pub fn run() -> Result<()> {
     theme::apply(&window);
     crate::platform::gui::apply_window_icon(&window);
 
-    let mut icon_frame = nwg::ImageFrame::default();
-    nwg::ImageFrame::builder()
-        .parent(&window)
-        .size((
-            (ICON_SIZE as f64 * crate::platform::gui::ui_scale()).round() as i32,
-            (ICON_SIZE as f64 * crate::platform::gui::ui_scale()).round() as i32,
-        ))
-        .background_color(Some(theme::WINDOW_BG))
-        .build(&mut icon_frame)?;
-    if let Some(icon) = crate::platform::gui::app_icon(ICON_SIZE) {
-        show_icon(&icon_frame, icon);
-    }
+    // Kept only so the handles stay reachable in this scope; the child windows
+    // belong to `window` and are destroyed together with it.
+    let _icon_frame = create_icon_frame(&window);
 
     let name_font = font(22.0, 700)?;
     let version_font = font(12.0, 400)?;
@@ -83,7 +77,6 @@ pub fn run() -> Result<()> {
         .parent(&window)
         .build(&mut close)?;
 
-    crate::place!(icon_frame, 24, 24, ICON_SIZE, ICON_SIZE);
     crate::place!(name, 100, 28, 336, 32);
     crate::place!(version, 100, 64, 336, 22);
     crate::place!(summary, 24, 108, 412, 76);
@@ -117,31 +110,66 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Replaces the frame's (absent) bitmap with the shared application icon.
+/// Builds the static control that shows the application icon.
 ///
-/// `ImageFrame` picks `SS_BITMAP` when it is built without an image, and NWG
-/// gives no way to hand it a handle the executable already loaded, so the style
-/// is switched to `SS_ICON` here and the shared icon is pushed straight into the
-/// static control.
-fn show_icon(frame: &nwg::ImageFrame, icon: windows::Win32::UI::WindowsAndMessaging::HICON) {
-    let Some(raw) = frame.handle.hwnd() else {
-        return;
+/// `nwg::ImageFrame` is deliberately not used here: unless it is handed an
+/// `nwg::Icon` while it is built it is created as `SS_BITMAP`, and NWG offers no
+/// way to pass in a handle the executable already loaded. Switching the style
+/// afterwards leaves the bitmap branch's cached state on screen, which shows up
+/// as a full-size icon fragment in the frame's corner. A control created as
+/// `SS_ICON` paints cleanly from the first frame, and `SS_CENTERIMAGE` keeps the
+/// icon at its natural pixel size instead of stretching it to the frame.
+fn create_icon_frame(window: &nwg::Window) -> Option<HWND> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CHILD, WS_VISIBLE,
     };
-    let hwnd = HWND(raw as *mut core::ffi::c_void);
-    // SAFETY: `hwnd` belongs to the frame built above; the style update only
-    // swaps SS_BITMAP for SS_ICON, and the icon handle is owned by the resource
-    // section because it was loaded with LR_SHARED.
-    unsafe {
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        SetWindowLongW(hwnd, GWL_STYLE, ((style & !SS_BITMAP) | SS_ICON) as i32);
-        let _previous = SendMessageW(
-            hwnd,
-            STM_SETIMAGE,
-            WPARAM(IMAGE_ICON as usize),
-            LPARAM(icon.0 as isize),
-        );
-        let _painted = InvalidateRect(hwnd, None, BOOL(1));
+
+    let raw = window.handle.hwnd()?;
+    let parent = HWND(raw as *mut core::ffi::c_void);
+    let scale = crate::platform::gui::ui_scale();
+    let size = (f64::from(ICON_SIZE) * scale).round() as i32;
+    let x = (f64::from(ICON_X) * scale).round() as i32;
+    let y = (f64::from(ICON_Y) * scale).round() as i32;
+    let class: Vec<u16> = "Static".encode_utf16().chain(std::iter::once(0)).collect();
+    let style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | SS_ICON | SS_CENTERIMAGE);
+    // SAFETY: the parent handle belongs to the window built above, the class
+    // name buffer outlives the call, and the style only asks for a child static
+    // control owned by this process.
+    let hwnd = unsafe {
+        let module = GetModuleHandleW(None).ok()?;
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class.as_ptr()),
+            PCWSTR::null(),
+            style,
+            x,
+            y,
+            size,
+            size,
+            parent,
+            None,
+            HINSTANCE(module.0),
+            None,
+        )
+        .ok()?
+    };
+    if let Some(icon) = crate::platform::gui::app_icon(size as u32) {
+        // SAFETY: `hwnd` is the static control created above and the icon handle
+        // is owned by this executable's resource section (`LR_SHARED`), so the
+        // control must not destroy it.
+        unsafe {
+            let _previous = SendMessageW(
+                hwnd,
+                STM_SETIMAGE,
+                WPARAM(IMAGE_ICON as usize),
+                LPARAM(icon.0 as isize),
+            );
+        }
     }
+    Some(hwnd)
 }
 
 fn font(logical_size: f64, weight: u32) -> Result<nwg::Font> {
