@@ -22,12 +22,16 @@ pub const COLOR_RED: [u8; 3] = [239, 68, 68];
 /// Unknown-battery color.
 pub const COLOR_GRAY: [u8; 3] = [128, 128, 128];
 
-/// Returns the battery color using the original 60/30 percent thresholds.
+/// Returns the battery color for one percentage.
+///
+/// Green above 60 %, yellow from 20 % up to 60 %, red below 20 %. The tray bar
+/// and the panel percentage share this mapping so both read the same at a
+/// glance.
 pub fn percent_color(percent: Option<u8>) -> [u8; 3] {
     match percent {
         None => COLOR_GRAY,
-        Some(value) if value >= 60 => COLOR_GREEN,
-        Some(value) if value >= 30 => COLOR_YELLOW,
+        Some(value) if value > 60 => COLOR_GREEN,
+        Some(value) if value >= 20 => COLOR_YELLOW,
         Some(_) => COLOR_RED,
     }
 }
@@ -709,9 +713,12 @@ mod tests {
 
     #[test]
     fn thresholds_and_shapes_match_contract() {
-        assert_eq!(percent_color(Some(60)), COLOR_GREEN);
-        assert_eq!(percent_color(Some(30)), COLOR_YELLOW);
-        assert_eq!(percent_color(Some(29)), COLOR_RED);
+        assert_eq!(percent_color(Some(100)), COLOR_GREEN);
+        assert_eq!(percent_color(Some(61)), COLOR_GREEN);
+        assert_eq!(percent_color(Some(60)), COLOR_YELLOW);
+        assert_eq!(percent_color(Some(20)), COLOR_YELLOW);
+        assert_eq!(percent_color(Some(19)), COLOR_RED);
+        assert_eq!(percent_color(Some(1)), COLOR_RED);
         assert_eq!(percent_color(None), COLOR_GRAY);
         let mouse = device_icon_rgba("mouse", Some(70), 16, false, false);
         let keyboard = device_icon_rgba("keyboard", Some(70), 16, false, false);

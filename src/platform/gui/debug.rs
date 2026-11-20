@@ -1,5 +1,5 @@
 use super::{init_gui, status_text};
-use crate::battery::{BatteryReader, HidBackend, OpenOptions, SharedMouseCache};
+use crate::battery::{BatteryReader, HidBackend, OpenOptions, SharedReadingCache};
 use crate::config::ConfigStore;
 use crate::error::Result;
 use crate::platform::hid::{enumerate_hid, WindowsHidBackend};
@@ -182,7 +182,7 @@ pub fn run() -> Result<()> {
         interfaces: Vec::new(),
         selected: None,
         queue: Arc::new(Mutex::new(VecDeque::new())),
-        mouse_cache: SharedMouseCache::default(),
+        reading_cache: SharedReadingCache::default(),
         battery_busy: Arc::new(AtomicBool::new(false)),
         handlers: Vec::new(),
         closing: false,
@@ -270,7 +270,7 @@ struct DebugState {
     interfaces: Vec<crate::battery::HidInterface>,
     selected: Option<usize>,
     queue: BatteryResults,
-    mouse_cache: SharedMouseCache,
+    reading_cache: SharedReadingCache,
     battery_busy: Arc<AtomicBool>,
     handlers: Vec<nwg::EventHandler>,
     closing: bool,
@@ -671,13 +671,13 @@ impl DebugState {
         self.battery.set_enabled(false);
         let queue = Arc::clone(&self.queue);
         let busy = Arc::clone(&self.battery_busy);
-        let mouse_cache = Arc::clone(&self.mouse_cache);
+        let reading_cache = Arc::clone(&self.reading_cache);
         let sender = self.notice.sender();
         let started = super::task::spawn(busy, sender, move || {
             let mut reader = BatteryReader::with_cache(
                 WindowsHidBackend::new(),
                 ConfigStore::from_env(),
-                mouse_cache,
+                reading_cache,
             );
             let readings = reader.read_all(None);
             if let Ok(mut queue) = queue.lock() {

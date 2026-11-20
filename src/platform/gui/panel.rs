@@ -1,7 +1,7 @@
 #![allow(deprecated)]
 
 use super::{init_gui, status_text, Toggle};
-use crate::battery::{BatteryReader, SharedMouseCache};
+use crate::battery::{BatteryReader, SharedReadingCache};
 use crate::config::{ConfigStore, INTERVAL_CHOICES};
 use crate::error::Result;
 use crate::platform::hid::WindowsHidBackend;
@@ -134,7 +134,7 @@ pub fn run() -> Result<()> {
         busy: Arc::new(AtomicBool::new(false)),
         reload_pending: Arc::new(AtomicBool::new(false)),
         queue: Arc::new(Mutex::new(VecDeque::new())),
-        mouse_cache: SharedMouseCache::default(),
+        reading_cache: SharedReadingCache::default(),
         handlers: Vec::new(),
         closing: false,
     }));
@@ -200,7 +200,7 @@ struct PanelState {
     busy: Arc<AtomicBool>,
     reload_pending: Arc<AtomicBool>,
     queue: Arc<Mutex<VecDeque<Vec<Reading>>>>,
-    mouse_cache: SharedMouseCache,
+    reading_cache: SharedReadingCache,
     handlers: Vec<nwg::EventHandler>,
     closing: bool,
 }
@@ -461,7 +461,7 @@ impl PanelState {
         self.status.set_text("正在读取设备…");
         let queue = Arc::clone(&self.queue);
         let busy = Arc::clone(&self.busy);
-        let mouse_cache = Arc::clone(&self.mouse_cache);
+        let reading_cache = Arc::clone(&self.reading_cache);
         let sender = self.notice.sender();
         let store = self.store.clone();
         let started = super::task::spawn(busy, sender, move || {
@@ -471,7 +471,7 @@ impl PanelState {
                 .map(|profile| profile.key)
                 .collect::<Vec<_>>();
             let mut reader =
-                BatteryReader::with_cache(WindowsHidBackend::new(), store, mouse_cache);
+                BatteryReader::with_cache(WindowsHidBackend::new(), store, reading_cache);
             let readings = reader.read_all(Some(&keys));
             if let Ok(mut queue) = queue.lock() {
                 queue.push_back(readings);

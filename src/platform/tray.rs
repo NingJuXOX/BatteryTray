@@ -1,6 +1,6 @@
 #![allow(deprecated)]
 
-use crate::battery::{BatteryReader, HidInterface, SharedMouseCache};
+use crate::battery::{BatteryReader, HidInterface, SharedReadingCache};
 use crate::config::{ConfigStore, INTERVAL_CHOICES};
 use crate::error::{BatteryTrayError, Result};
 use crate::icon::{custom_icon_rgba, device_icon_rgba, icon_bytes};
@@ -142,7 +142,7 @@ pub fn run() -> Result<()> {
         busy,
         interfaces,
         interfaces_dirty: dirty,
-        mouse_cache: SharedMouseCache::default(),
+        reading_cache: SharedReadingCache::default(),
         queued_manual: false,
         config_signature: Vec::new(),
         exit_requested: false,
@@ -385,7 +385,7 @@ struct TrayState {
     busy: Arc<AtomicBool>,
     interfaces: Arc<Mutex<Vec<HidInterface>>>,
     interfaces_dirty: Arc<AtomicBool>,
-    mouse_cache: SharedMouseCache,
+    reading_cache: SharedReadingCache,
     queued_manual: bool,
     config_signature: Vec<DeviceProfile>,
     exit_requested: bool,
@@ -542,7 +542,7 @@ impl TrayState {
         let busy = Arc::clone(&self.busy);
         let interfaces = Arc::clone(&self.interfaces);
         let dirty = Arc::clone(&self.interfaces_dirty);
-        let mouse_cache = Arc::clone(&self.mouse_cache);
+        let reading_cache = Arc::clone(&self.reading_cache);
         let sender = self.notice.sender();
         let store = self.store.clone();
         let started = crate::platform::gui::task::spawn(busy, sender, move || {
@@ -568,7 +568,7 @@ impl TrayState {
                 interfaces.lock().ok().map(|items| items.clone())
             };
             let mut reader =
-                BatteryReader::with_cache(WindowsHidBackend::new(), store, mouse_cache);
+                BatteryReader::with_cache(WindowsHidBackend::new(), store, reading_cache);
             let readings = match snapshot {
                 Some(found) => reader.read_profiles_with_interfaces(&wanted, &found),
                 None => wanted

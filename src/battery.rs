@@ -8,6 +8,7 @@ use crate::protocol::{
 use chrono::{DateTime, Local};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -141,16 +142,56 @@ pub trait HidBackend: Send {
         Self: Sized;
 }
 
-/// Last valid mouse reading retained while the mouse is sleeping.
-#[derive(Debug, Clone, Default)]
-pub struct MouseCache {
-    percent: Option<u8>,
-    updated: Option<DateTime<Local>>,
-    acquired: Option<Instant>,
+/// One successful percentage, kept so an idle device still shows a number.
+#[derive(Debug, Clone)]
+struct CachedReading {
+    percent: u8,
+    updated: DateTime<Local>,
+    acquired: Instant,
 }
 
-/// Shared process-local cache used to retain the last valid mouse reading.
-pub type SharedMouseCache = Arc<Mutex<MouseCache>>;
+/// Process-local cache of the last successful percentage per device key.
+///
+/// Sleep, offline and error results carry no percentage of their own. Without
+/// this cache the tray falls back to 「--」 a few seconds after an idle
+/// mouse parks its radio, even though a percentage was read moments earlier.
+#[derive(Debug, Clone, Default)]
+pub struct ReadingCache {
+    entries: HashMap<String, CachedReading>,
+}
+
+impl ReadingCache {
+    /// Stores the newest percentage for one device key.
+    fn remember(&mut self, key: &str, percent: u8, updated: DateTime<Local>) {
+        self.entries.insert(
+            key.to_owned(),
+            CachedReading {
+                percent,
+                updated,
+                acquired: Instant::now(),
+            },
+        );
+    }
+
+    /// Returns the cached percentage, when it was read, and how long ago.
+    fn recall(&self, key: &str) -> Option<(u8, DateTime<Local>, Duration)> {
+        self.entries
+            .get(key)
+            .map(|entry| (entry.percent, entry.updated, entry.acquired.elapsed()))
+    }
+}
+
+/// Shared process-local cache of the last successful reading per device.
+pub type SharedReadingCache = Arc<Mutex<ReadingCache>>;
+
+/// Renders a cache age as 「8 秒」 or 「3 分钟」.
+fn age_text(age: Duration) -> String {
+    if age.as_secs() < 60 {
+        format!("{} 秒", age.as_secs().max(1))
+    } else {
+        format!("{} 分钟", (age.as_secs() / 60).max(1))
+    }
+}
 
 /// Last Windows error reported by any device opened by one reader.
 ///
@@ -222,7 +263,7 @@ fn is_transient_error(code: u32) -> bool {
 pub struct BatteryReader<B> {
     backend: B,
     config: ConfigStore,
-    mouse_cache: SharedMouseCache,
+    reading_cache: SharedReadingCache,
     debug: bool,
     device_error: DeviceError,
 }
@@ -233,18 +274,18 @@ impl<B: HidBackend> BatteryReader<B> {
         Self {
             backend,
             config,
-            mouse_cache: Arc::new(Mutex::new(MouseCache::default())),
+            reading_cache: Arc::new(Mutex::new(ReadingCache::default())),
             debug: false,
             device_error: DeviceError::default(),
         }
     }
 
-    /// Creates a reader that shares the mouse sleep cache with other workers.
-    pub fn with_cache(backend: B, config: ConfigStore, cache: SharedMouseCache) -> Self {
+    /// Creates a reader that shares the reading cache with other workers.
+    pub fn with_cache(backend: B, config: ConfigStore, cache: SharedReadingCache) -> Self {
         Self {
             backend,
             config,
-            mouse_cache: cache,
+            reading_cache: cache,
             debug: false,
             device_error: DeviceError::default(),
         }
@@ -337,7 +378,7 @@ impl<B: HidBackend> BatteryReader<B> {
         Self {
             backend: self.backend.duplicate(),
             config: self.config.clone(),
-            mouse_cache: Arc::clone(&self.mouse_cache),
+            reading_cache: Arc::clone(&self.reading_cache),
             debug: self.debug,
             device_error: DeviceError::default(),
         }
@@ -433,20 +474,20 @@ impl<B: HidBackend> BatteryReader<B> {
         let lock = match self.backend.lock(&lock_key, DEVICE_LOCK_TIMEOUT_MS) {
             Ok(Some(lock)) => lock,
             Ok(None) => {
-                return Reading::new(
+                return self.with_cached_percent(Reading::new(
                     profile,
                     None,
                     ReadingStatus::Busy,
                     "设备正被另一个窗口读取，请稍后重试",
-                )
+                ))
             }
             Err(error) => {
-                return Reading::new(
+                return self.with_cached_percent(Reading::new(
                     profile,
                     None,
                     ReadingStatus::Error,
                     format!("获取设备锁失败：{error}"),
-                )
+                ))
             }
         };
         let _lock = lock;
@@ -456,7 +497,7 @@ impl<B: HidBackend> BatteryReader<B> {
         self.device_error.clear();
         let first = self.dispatch(profile, interfaces, &calibration);
         if first.status != ReadingStatus::Error {
-            return first;
+            return self.with_cached_percent(first);
         }
         let code = self.device_error.load();
         if !is_transient_error(code) {
@@ -466,7 +507,7 @@ impl<B: HidBackend> BatteryReader<B> {
                     profile.key, first.message
                 );
             }
-            return first;
+            return self.with_cached_percent(first);
         }
         if self.debug {
             eprintln!(
@@ -475,7 +516,46 @@ impl<B: HidBackend> BatteryReader<B> {
             );
         }
         self.device_error.clear();
-        self.dispatch(profile, interfaces, &calibration)
+        let retried = self.dispatch(profile, interfaces, &calibration);
+        self.with_cached_percent(retried)
+    }
+
+    /// Remembers a fresh percentage, and fills in the previous one otherwise.
+    ///
+    /// The status stays truthful — 「休眠」, 「离线」, 「错误」 still say what the hardware
+    /// did — but the number no longer disappears, and the message states how old
+    /// it is.
+    fn with_cached_percent(&self, mut reading: Reading) -> Reading {
+        let Ok(mut cache) = self.reading_cache.lock() else {
+            return reading;
+        };
+        if matches!(reading.status, ReadingStatus::Ok | ReadingStatus::Charging) {
+            if let Some(percent) = reading.percent {
+                cache.remember(&reading.key, percent, reading.updated);
+            }
+            return reading;
+        }
+        if reading.percent.is_some() {
+            return reading;
+        }
+        let Some((percent, updated, age)) = cache.recall(&reading.key) else {
+            return reading;
+        };
+        reading.percent = Some(percent);
+        reading.updated = updated;
+        let note = format!("显示 {}前的读数", age_text(age));
+        reading.message = if reading.message.trim().is_empty() {
+            note
+        } else {
+            format!("{}（{note}）", reading.message.trim())
+        };
+        reading
+            .detail
+            .insert("cached".to_owned(), Value::from(true));
+        reading
+            .detail
+            .insert("age".to_owned(), Value::from(age.as_secs_f64()));
+        reading
     }
 
     fn dispatch(
@@ -587,6 +667,36 @@ impl<B: HidBackend> BatteryReader<B> {
         }
         let online = data[4] == 0;
         if !online {
+            // The receiver keeps answering with the last level it saw even
+            // after the mouse parks its radio, so that frame is still worth
+            // showing. The status stays 「休眠」: the mouse did not answer,
+            // and an idle device must not count towards the failure streak.
+            let reported = data
+                .get(battery_index)
+                .copied()
+                .filter(|value| (1..=100).contains(value));
+            if let Some(percent) = reported {
+                let updated = Local::now();
+                if let Ok(mut cache) = self.reading_cache.lock() {
+                    cache.remember(&profile.key, percent, updated);
+                }
+                let mut reading = Reading::new(
+                    profile,
+                    Some(percent),
+                    ReadingStatus::Sleeping,
+                    "鼠标休眠中，显示接收器报告的最后电量",
+                );
+                reading.source = "HID Feature 0xF7".to_owned();
+                reading.updated = updated;
+                reading
+                    .detail
+                    .insert("online".to_owned(), Value::from(false));
+                reading.detail.insert(
+                    "raw".to_owned(),
+                    Value::from(crate::protocol::hex_dump(&response)),
+                );
+                return reading;
+            }
             let mut reading = Reading::new(
                 profile,
                 None,
@@ -611,12 +721,8 @@ impl<B: HidBackend> BatteryReader<B> {
             return self.mouse_sleeping(profile);
         };
         let updated = Local::now();
-        if let Ok(mut cache) = self.mouse_cache.lock() {
-            *cache = MouseCache {
-                percent: Some(percent),
-                updated: Some(updated),
-                acquired: Some(Instant::now()),
-            };
+        if let Ok(mut cache) = self.reading_cache.lock() {
+            cache.remember(&profile.key, percent, updated);
         }
         let mut reading = Reading::new(profile, Some(percent), ReadingStatus::Ok, "");
         reading.source = "HID Feature 0xF7".to_owned();
@@ -635,33 +741,27 @@ impl<B: HidBackend> BatteryReader<B> {
     }
 
     fn mouse_sleeping(&self, profile: &DeviceProfile) -> Reading {
-        let cached =
-            self.mouse_cache.lock().ok().and_then(|cache| {
-                Some((cache.percent?, cache.updated?, cache.acquired?.elapsed()))
-            });
+        let cached = self
+            .reading_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.recall(&profile.key));
         if let Some((percent, updated, age)) = cached {
-            if age < Duration::from_secs(600) {
-                let age_text = if age.as_secs() < 60 {
-                    format!("{} 秒", age.as_secs().max(1))
-                } else {
-                    format!("{} 分钟", (age.as_secs() / 60).max(1))
-                };
-                let mut reading = Reading::new(
-                    profile,
-                    Some(percent),
-                    ReadingStatus::Sleeping,
-                    format!("鼠标休眠中，当前显示 {age_text}前的缓存"),
-                );
-                reading.source = "HID Feature 0xF7（缓存）".to_owned();
-                reading.updated = updated;
-                reading
-                    .detail
-                    .insert("cached".to_owned(), Value::from(true));
-                reading
-                    .detail
-                    .insert("age".to_owned(), Value::from(age.as_secs_f64()));
-                return reading;
-            }
+            let mut reading = Reading::new(
+                profile,
+                Some(percent),
+                ReadingStatus::Sleeping,
+                format!("鼠标休眠中，显示 {}前的电量", age_text(age)),
+            );
+            reading.source = "HID Feature 0xF7（缓存）".to_owned();
+            reading.updated = updated;
+            reading
+                .detail
+                .insert("cached".to_owned(), Value::from(true));
+            reading
+                .detail
+                .insert("age".to_owned(), Value::from(age.as_secs_f64()));
+            return reading;
         }
         Reading::new(
             profile,
@@ -1318,7 +1418,7 @@ mod tests {
         response[3] = 81;
         response[5] = 0;
         response[7] = 2;
-        let cache = SharedMouseCache::default();
+        let cache = SharedReadingCache::default();
         let mut fresh_reader = BatteryReader::with_cache(
             ResponseBackend {
                 response: Some(response),
@@ -1335,7 +1435,8 @@ mod tests {
         assert_eq!(sleeping.percent, Some(81));
         assert_eq!(sleeping.status, ReadingStatus::Sleeping);
         assert_eq!(sleeping.updated, acquired_at);
-        assert!(sleeping.message.contains("缓存"));
+        assert!(sleeping.message.contains("显示"));
+        assert!(sleeping.source.contains("缓存"));
     }
 
     #[test]

@@ -329,6 +329,13 @@ fn draw_card(item: &DRAWITEMSTRUCT, text: &str) {
         } else {
             format!("{percent}%")
         };
+        // Same thresholds as the tray bar, so one glance is enough to tell a
+        // full battery from a nearly empty one in either place.
+        let percent_tint = if percent < 0 {
+            MUTED
+        } else {
+            crate::icon::percent_color(Some(percent.clamp(0, 100) as u8))
+        };
         let mut percent_rect = RECT {
             left: text_x,
             top: r.top + px(36.0),
@@ -340,7 +347,7 @@ fn draw_card(item: &DRAWITEMSTRUCT, text: &str) {
             &shown,
             &mut percent_rect,
             card_font(&PERCENT_FONT, 27.0, 700),
-            BUTTON_TEXT,
+            percent_tint,
         );
 
         let mut status_rect = RECT {
