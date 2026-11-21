@@ -106,7 +106,6 @@ mod tests {
         let mut keys = HashSet::new();
         let mut rounds = HashMap::new();
 
-        // First sighting: the device is remembered as USB hardware.
         let kept = keep_present_receivers(
             vec![receiver_device()],
             std::slice::from_ref(&usb),
@@ -114,7 +113,6 @@ mod tests {
             &mut rounds,
         );
         assert_eq!(kept.len(), 1);
-        assert!(keys.contains("mouse"));
 
         // One miss is not proof: a re-enumeration can briefly look empty.
         let kept = keep_present_receivers(vec![receiver_device()], &[], &mut keys, &mut rounds);
@@ -137,6 +135,29 @@ mod tests {
         assert!(kept.is_empty(), "the second miss removes the icon");
     }
 
+    /// The bug that made a headphone icon survive while its receiver was out:
+    /// a device that was never seen at all used to be kept forever.
+    #[test]
+    fn receiver_missing_at_startup_is_hidden_too() {
+        let other = foreign_interface();
+        let mut keys = HashSet::new();
+        let mut rounds = HashMap::new();
+        let kept = keep_present_receivers(
+            vec![receiver_device()],
+            std::slice::from_ref(&other),
+            &mut keys,
+            &mut rounds,
+        );
+        assert_eq!(kept.len(), 1, "the first miss is tolerated");
+        let kept = keep_present_receivers(
+            vec![receiver_device()],
+            std::slice::from_ref(&other),
+            &mut keys,
+            &mut rounds,
+        );
+        assert!(kept.is_empty(), "a never-seen device is hidden as well");
+    }
+
     #[test]
     fn bluetooth_device_is_never_hidden() {
         let bluetooth = interface(
@@ -151,23 +172,32 @@ mod tests {
             &mut rounds,
         );
         assert_eq!(kept.len(), 1);
-        assert!(
-            !keys.contains("mouse"),
-            "a Bluetooth node is not a receiver and its absence means nothing"
-        );
+        assert!(keys.contains("mouse"), "a Bluetooth sighting is remembered");
 
+        let other = foreign_interface();
+        for _ in 0..ABSENT_ROUNDS_BEFORE_HIDE + 2 {
+            let kept = keep_present_receivers(
+                vec![receiver_device()],
+                std::slice::from_ref(&other),
+                &mut keys,
+                &mut rounds,
+            );
+            assert_eq!(kept.len(), 1, "a Bluetooth device may be asleep");
+        }
         let kept = keep_present_receivers(vec![receiver_device()], &[], &mut keys, &mut rounds);
         assert_eq!(kept.len(), 1);
     }
 
     #[test]
     fn remembered_receiver_forgets_removed_devices() {
-        let usb = interface(r"\\?\hid#vid_374a&pid_a322&mi_02#9&aa0cfae&0&0000");
+        let bluetooth = interface(
+            r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0001004c_pid&b023#9&1&0000",
+        );
         let mut keys = HashSet::new();
         let mut rounds = HashMap::new();
         let _ = keep_present_receivers(
             vec![receiver_device()],
-            std::slice::from_ref(&usb),
+            std::slice::from_ref(&bluetooth),
             &mut keys,
             &mut rounds,
         );
@@ -176,7 +206,7 @@ mod tests {
         // The user deletes the device: its bookkeeping goes away with it.
         let kept = keep_present_receivers(
             Vec::new(),
-            std::slice::from_ref(&usb),
+            std::slice::from_ref(&bluetooth),
             &mut keys,
             &mut rounds,
         );
@@ -190,18 +220,22 @@ mod tests {
 ///
 /// A receiver is a separate USB device, so `enumerate_hid` stops listing it once
 /// it is unplugged and the profile matches nothing any more; its tray icon would
-/// then only ever show "--". Two cases are left alone on purpose: an empty
-/// interface list means enumeration failed rather than "every receiver was
-/// removed", and a profile that only ever matched a Bluetooth node is kept,
-/// because Windows drops such a node whenever the device sleeps.
+/// then only ever show "--". An empty interface list is left alone on purpose:
+/// that means enumeration failed, not that every receiver was removed.
 ///
-/// `receiver_keys` remembers which devices were seen as USB hardware;
-/// `absent_rounds` counts how many enumerations in a row missed each of them, so
+/// `bluetooth_keys` is the one exemption. Windows deletes a Bluetooth node every
+/// time the radio parks, so once a device has been seen as a Bluetooth node in
+/// this run its absence says nothing about the hardware and the icon stays.
+/// A device that has never been seen at all is treated like an unplugged
+/// receiver — otherwise a receiver that was already missing when the tray
+/// started would keep an icon forever.
+///
+/// `absent_rounds` counts how many enumerations in a row missed each device, so
 /// a single blip does not make the icon flicker.
 pub(crate) fn keep_present_receivers(
     visible: Vec<DeviceProfile>,
     interfaces: &[HidInterface],
-    receiver_keys: &mut HashSet<String>,
+    bluetooth_keys: &mut HashSet<String>,
     absent_rounds: &mut HashMap<String, u8>,
 ) -> Vec<DeviceProfile> {
     if interfaces.is_empty() {
@@ -216,13 +250,13 @@ pub(crate) fn keep_present_receivers(
     for profile in visible {
         if crate::battery::has_matching_interface(&profile, interfaces) {
             absent_rounds.remove(&profile.key);
-            if !crate::battery::has_bluetooth_interface(&profile, interfaces) {
-                receiver_keys.insert(profile.key.clone());
+            if crate::battery::has_bluetooth_interface(&profile, interfaces) {
+                bluetooth_keys.insert(profile.key.clone());
             }
             kept.push(profile);
             continue;
         }
-        if !receiver_keys.contains(&profile.key) {
+        if bluetooth_keys.contains(&profile.key) {
             kept.push(profile);
             continue;
         }
@@ -233,7 +267,7 @@ pub(crate) fn keep_present_receivers(
         }
     }
     // Forget devices that are no longer configured at all.
-    receiver_keys.retain(|key| configured.iter().any(|item| item == key));
+    bluetooth_keys.retain(|key| configured.iter().any(|item| item == key));
     absent_rounds.retain(|key, _| configured.iter().any(|item| item == key));
     kept
 }
@@ -319,7 +353,7 @@ pub fn run() -> Result<()> {
         busy,
         interfaces,
         interfaces_dirty: dirty,
-        receiver_keys: HashSet::new(),
+        bluetooth_keys: HashSet::new(),
         absent_rounds: HashMap::new(),
         reading_cache: SharedReadingCache::default(),
         queued_manual: false,
@@ -564,7 +598,7 @@ struct TrayState {
     busy: Arc<AtomicBool>,
     interfaces: Arc<Mutex<Vec<HidInterface>>>,
     interfaces_dirty: Arc<AtomicBool>,
-    receiver_keys: HashSet<String>,
+    bluetooth_keys: HashSet<String>,
     absent_rounds: HashMap<String, u8>,
     reading_cache: SharedReadingCache,
     queued_manual: bool,
@@ -937,7 +971,7 @@ impl TrayState {
         keep_present_receivers(
             visible,
             &interfaces,
-            &mut self.receiver_keys,
+            &mut self.bluetooth_keys,
             &mut self.absent_rounds,
         )
     }
